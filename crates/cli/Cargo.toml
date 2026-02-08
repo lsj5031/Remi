@@ -1,0 +1,24 @@
+[package]
+name = "cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "remi"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+archive = { path = "../archive" }
+chrono.workspace = true
+clap.workspace = true
+claude = { path = "../adapters/claude" }
+core-model = { path = "../core-model" }
+droid = { path = "../adapters/droid" }
+humantime.workspace = true
+ingest = { path = "../ingest" }
+opencode = { path = "../adapters/opencode" }
+pi = { path = "../adapters/pi" }
+search = { path = "../search" }
+store-sqlite = { path = "../store-sqlite" }
