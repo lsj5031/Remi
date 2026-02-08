@@ -171,13 +171,18 @@ impl SqliteStore {
                   ts=excluded.ts"#,
             )?;
             for m in &batch.messages {
-                stmt_msg.execute(params![m.id, m.session_id, m.role, m.content, m.ts.to_rfc3339()])?;
+                stmt_msg.execute(params![
+                    m.id,
+                    m.session_id,
+                    m.role,
+                    m.content,
+                    m.ts.to_rfc3339()
+                ])?;
             }
         }
         {
-            let mut stmt_fts_del = tx.prepare_cached(
-                "DELETE FROM fts_messages WHERE message_id = ?1",
-            )?;
+            let mut stmt_fts_del =
+                tx.prepare_cached("DELETE FROM fts_messages WHERE message_id = ?1")?;
             let mut stmt_fts_ins = tx.prepare_cached(
                 "INSERT INTO fts_messages (message_id, session_id, content, ts) VALUES (?1, ?2, ?3, ?4)",
             )?;
@@ -252,7 +257,9 @@ impl SqliteStore {
 
     #[cfg(feature = "semantic")]
     pub fn load_all_embeddings(&self) -> anyhow::Result<Vec<(String, Vec<f32>)>> {
-        let mut stmt = self.conn.prepare("SELECT message_id, vec FROM message_embeddings")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT message_id, vec FROM message_embeddings")?;
         let rows = stmt.query_map([], |r| {
             let id: String = r.get(0)?;
             let blob: Vec<u8> = r.get(1)?;
@@ -262,9 +269,9 @@ impl SqliteStore {
                 .collect();
             Ok((id, vec))
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
-
 
     pub fn get_checkpoint(&self, agent: &str) -> anyhow::Result<Option<String>> {
         self.conn
@@ -567,7 +574,12 @@ mod tests {
         store.save_batch(&batch).expect("empty batch is fine");
     }
 
-    fn make_batch(agent: AgentKind, session_id: &str, msg_id: &str, content: &str) -> NormalizedBatch {
+    fn make_batch(
+        agent: AgentKind,
+        session_id: &str,
+        msg_id: &str,
+        content: &str,
+    ) -> NormalizedBatch {
         let now = Utc::now();
         NormalizedBatch {
             sessions: vec![Session {
@@ -689,7 +701,12 @@ mod tests {
     fn fts_search() {
         let mut store = SqliteStore::open(":memory:").unwrap();
         store.init_schema().unwrap();
-        let batch = make_batch(core_model::AgentKind::Pi, "s1", "m1", "rust programming language");
+        let batch = make_batch(
+            core_model::AgentKind::Pi,
+            "s1",
+            "m1",
+            "rust programming language",
+        );
         store.save_batch(&batch).unwrap();
         let results = store.search_lexical("rust", 10).unwrap();
         assert_eq!(results.len(), 1);
@@ -731,16 +748,16 @@ mod tests {
             });
         }
         store.save_batch(&batch).unwrap();
-        let run1 = store
-            .plan_archive(Duration::days(30), 2)
-            .unwrap();
+        let run1 = store.plan_archive(Duration::days(30), 2).unwrap();
         let items1 = store.archive_items_for_run(&run1.id).unwrap();
         assert_eq!(items1.len(), 3);
-        let run2 = store
-            .plan_archive(Duration::days(30), 2)
-            .unwrap();
+        let run2 = store.plan_archive(Duration::days(30), 2).unwrap();
         let items2 = store.archive_items_for_run(&run2.id).unwrap();
-        assert_eq!(items2.len(), 0, "idempotency: already-planned sessions should be skipped");
+        assert_eq!(
+            items2.len(),
+            0,
+            "idempotency: already-planned sessions should be skipped"
+        );
     }
 
     #[test]
@@ -771,7 +788,12 @@ mod tests {
     fn substring_search() {
         let mut store = SqliteStore::open(":memory:").unwrap();
         store.init_schema().unwrap();
-        let batch = make_batch(core_model::AgentKind::Pi, "s1", "m1", "hello_world function");
+        let batch = make_batch(
+            core_model::AgentKind::Pi,
+            "s1",
+            "m1",
+            "hello_world function",
+        );
         store.save_batch(&batch).unwrap();
         let results = store.search_substring("hello_world", 10).unwrap();
         assert_eq!(results.len(), 1);

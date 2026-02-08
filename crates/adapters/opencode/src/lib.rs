@@ -1,7 +1,4 @@
-use std::{
-    fs,
-    path::PathBuf,
-};
+use std::{fs, path::PathBuf};
 
 use chrono::{DateTime, TimeZone, Utc};
 use core_model::{

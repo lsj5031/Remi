@@ -1,7 +1,14 @@
-use std::time::Instant;
+use std::{
+    io::{self, Write},
+    path::PathBuf,
+    time::Instant,
+};
 
 use anyhow::Context;
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use core_model::{Message, Session};
+use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use ingest::SyncPhase;
 use store_sqlite::SqliteStore;
 
@@ -63,7 +70,18 @@ enum SessionsCommand {
 
 #[derive(Subcommand)]
 enum SearchCommand {
-    Query { query: String },
+    Query {
+        query: String,
+        #[arg(long, value_enum, default_value_t = SearchFormat::Html)]
+        format: SearchFormat,
+        #[arg(long, default_value_t = false)]
+        no_interactive: bool,
+        #[cfg(feature = "semantic")]
+        #[arg(long, value_enum, default_value_t = SemanticMode::Auto)]
+        semantic: SemanticMode,
+        #[arg(long)]
+        output_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -90,6 +108,41 @@ enum ArchiveCommand {
     },
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum SearchFormat {
+    Html,
+    Markdown,
+}
+
+#[cfg(feature = "semantic")]
+#[derive(Clone, Copy, ValueEnum)]
+enum SemanticMode {
+    Auto,
+    On,
+    Off,
+}
+
+impl SearchFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            SearchFormat::Html => "html",
+            SearchFormat::Markdown => "md",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SessionDisplay {
+    session_id: String,
+    title: String,
+    agent: String,
+    updated_at: DateTime<Utc>,
+    message_count: usize,
+    snippet: String,
+    score: f32,
+    match_text: String,
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     #[cfg(feature = "semantic")]
@@ -104,11 +157,17 @@ fn main() -> anyhow::Result<()> {
     let mut embedder = if let Some(semantic) = &config.semantic {
         if semantic.enabled {
             if let Some(path) = &semantic.model_path {
-                 eprintln!("loading embedding model from {}...", path);
-                 Some(embeddings::Embedder::new(path, semantic.pooling.as_deref(), semantic.query_prefix.as_deref())?)
+                eprintln!("loading embedding model from {}...", path);
+                Some(embeddings::Embedder::new(
+                    path,
+                    semantic.pooling.as_deref(),
+                    semantic.query_prefix.as_deref(),
+                )?)
             } else {
-                 eprintln!("warning: semantic search enabled but no model_path configured; skipping");
-                 None
+                eprintln!(
+                    "warning: semantic search enabled but no model_path configured; skipping"
+                );
+                None
             }
         } else {
             None
@@ -124,44 +183,42 @@ fn main() -> anyhow::Result<()> {
         Commands::Sync(args) => {
             let synced = match args.agent {
                 AgentOpt::Pi => sync_one(
-                    "pi", 
-                    &pi::PiAdapter, 
+                    "pi",
+                    &pi::PiAdapter,
                     &mut store,
                     #[cfg(feature = "semantic")]
-                    embedder.as_mut()
+                    embedder.as_mut(),
                 )?,
                 AgentOpt::Droid => sync_one(
-                    "droid", 
-                    &droid::DroidAdapter, 
+                    "droid",
+                    &droid::DroidAdapter,
                     &mut store,
                     #[cfg(feature = "semantic")]
-                    embedder.as_mut()
+                    embedder.as_mut(),
                 )?,
-                AgentOpt::Opencode => {
-                    sync_one(
-                        "opencode", 
-                        &opencode::OpenCodeAdapter, 
-                        &mut store,
-                        #[cfg(feature = "semantic")]
-                        embedder.as_mut()
-                    )?
-                }
-                AgentOpt::Claude => sync_one(
-                    "claude", 
-                    &claude::ClaudeAdapter, 
+                AgentOpt::Opencode => sync_one(
+                    "opencode",
+                    &opencode::OpenCodeAdapter,
                     &mut store,
                     #[cfg(feature = "semantic")]
-                    embedder.as_mut()
+                    embedder.as_mut(),
+                )?,
+                AgentOpt::Claude => sync_one(
+                    "claude",
+                    &claude::ClaudeAdapter,
+                    &mut store,
+                    #[cfg(feature = "semantic")]
+                    embedder.as_mut(),
                 )?,
                 AgentOpt::All => {
                     let mut total = 0;
                     for (name, adapter) in adapters() {
                         total += sync_one(
-                            name, 
-                            adapter.as_ref(), 
+                            name,
+                            adapter.as_ref(),
                             &mut store,
                             #[cfg(feature = "semantic")]
-                            embedder.as_mut()
+                            embedder.as_mut(),
                         )?;
                     }
                     total
@@ -186,19 +243,80 @@ fn main() -> anyhow::Result<()> {
             }
         },
         Commands::Search { command } => match command {
-            SearchCommand::Query { query } => {
+            SearchCommand::Query {
+                query,
+                format,
+                no_interactive,
+                #[cfg(feature = "semantic")]
+                semantic,
+                output_dir,
+            } => {
                 eprintln!("searching for \"{}\"...", query);
-                let hits = search::search(
-                    &store, 
-                    &query, 
+                #[cfg(feature = "semantic")]
+                let search_embedder = match semantic {
+                    SemanticMode::Off => None,
+                    SemanticMode::Auto => embedder.as_mut(),
+                    SemanticMode::On => {
+                        if embedder.is_none() {
+                            eprintln!(
+                                "warning: semantic search requested but no embedder configured"
+                            );
+                        }
+                        embedder.as_mut()
+                    }
+                };
+                let hits = search::search_sessions(
+                    &store,
+                    &query,
                     20,
                     #[cfg(feature = "semantic")]
-                    embedder.as_mut()
+                    search_embedder,
                 )?;
-                eprintln!("{} results in {:.1?}", hits.len(), t.elapsed());
-                for hit in &hits {
-                    println!("{:.3} {} {}", hit.score, hit.session_id, hit.content);
+                if hits.is_empty() {
+                    eprintln!("no results in {:.1?}", t.elapsed());
+                    return Ok(());
                 }
+                let mut sessions = build_session_displays(&store, &hits)?;
+                if sessions.is_empty() {
+                    eprintln!("no sessions to display in {:.1?}", t.elapsed());
+                    return Ok(());
+                }
+
+                let selected = if no_interactive {
+                    sessions.sort_by(|a, b| b.score.total_cmp(&a.score));
+                    sessions[0].clone()
+                } else {
+                    eprintln!("{} sessions matched in {:.1?}", sessions.len(), t.elapsed());
+                    print_session_list(&sessions);
+                    let filter = prompt_line("filter (fuzzy, enter to keep): ")?;
+                    let filtered = if filter.trim().is_empty() {
+                        sessions
+                    } else {
+                        fuzzy_filter_sessions(&sessions, &filter)
+                    };
+                    if filtered.is_empty() {
+                        eprintln!("no sessions matched filter");
+                        return Ok(());
+                    }
+                    print_session_list(&filtered);
+                    let choice = prompt_line("select index (default 0): ")?;
+                    let index = parse_index(&choice, filtered.len())?;
+                    filtered[index].clone()
+                };
+
+                let session = store
+                    .get_session(&selected.session_id)?
+                    .with_context(|| "selected session missing")?;
+                let messages = store.get_session_messages(&selected.session_id)?;
+                let rendered = match format {
+                    SearchFormat::Html => render_session_html(&session, &messages),
+                    SearchFormat::Markdown => render_session_markdown(&session, &messages),
+                };
+                let out_dir = resolve_output_dir(output_dir)?;
+                let file_path =
+                    out_dir.join(format!("session_{}.{}", session.id, format.extension()));
+                std::fs::write(&file_path, rendered)?;
+                println!("{}", file_path.display());
             }
         },
         Commands::Archive { command } => match command {
@@ -248,23 +366,25 @@ fn main() -> anyhow::Result<()> {
         Commands::Embed { rebuild } => {
             if let Some(embedder) = embedder.as_mut() {
                 if rebuild {
-                     eprintln!("rebuilding embeddings...");
-                     let sessions = store.list_sessions()?;
-                     let mut count = 0;
-                     for s in &sessions {
-                         let msgs = store.get_session_messages(&s.id)?;
-                         for m in msgs {
-                             if m.content.trim().is_empty() { continue; }
-                             if let Ok(vec) = embedder.embed(&m.content, false) {
-                                 store.save_embedding(&m.id, &vec)?;
-                                 count += 1;
-                             }
-                         }
-                         if count > 0 && count % 100 == 0 {
-                             eprintln!("processed {} messages...", count);
-                         }
-                     }
-                     eprintln!("computed {} embeddings in {:.1?}", count, t.elapsed());
+                    eprintln!("rebuilding embeddings...");
+                    let sessions = store.list_sessions()?;
+                    let mut count = 0;
+                    for s in &sessions {
+                        let msgs = store.get_session_messages(&s.id)?;
+                        for m in msgs {
+                            if m.content.trim().is_empty() {
+                                continue;
+                            }
+                            if let Ok(vec) = embedder.embed(&m.content, false) {
+                                store.save_embedding(&m.id, &vec)?;
+                                count += 1;
+                            }
+                        }
+                        if count > 0 && count % 100 == 0 {
+                            eprintln!("processed {} messages...", count);
+                        }
+                    }
+                    eprintln!("computed {} embeddings in {:.1?}", count, t.elapsed());
                 } else {
                     eprintln!("use --rebuild to rebuild all embeddings");
                 }
@@ -298,21 +418,196 @@ fn sync_one(
     name: &str,
     adapter: &dyn core_model::AgentAdapter,
     store: &mut SqliteStore,
-    #[cfg(feature = "semantic")]
-    embedder: Option<&mut embeddings::Embedder>,
+    #[cfg(feature = "semantic")] embedder: Option<&mut embeddings::Embedder>,
 ) -> anyhow::Result<usize> {
-    ingest::sync_adapter(adapter, store, 
+    ingest::sync_adapter(
+        adapter,
+        store,
         #[cfg(feature = "semantic")]
         embedder,
         |phase| match phase {
-        SyncPhase::Discovering => eprintln!("[{name}] discovering source files..."),
-        SyncPhase::Scanning { file_count } => eprintln!("[{name}] scanning {file_count} files..."),
-        SyncPhase::Normalizing { record_count } => {
-            eprintln!("[{name}] normalizing {record_count} records...")
+            SyncPhase::Discovering => eprintln!("[{name}] discovering source files..."),
+            SyncPhase::Scanning { file_count } => {
+                eprintln!("[{name}] scanning {file_count} files...")
+            }
+            SyncPhase::Normalizing { record_count } => {
+                eprintln!("[{name}] normalizing {record_count} records...")
+            }
+            SyncPhase::Saving { message_count } => {
+                eprintln!("[{name}] saving {message_count} messages...")
+            }
+            SyncPhase::Done { total_records } => {
+                eprintln!("[{name}] done: {total_records} records")
+            }
+        },
+    )
+}
+
+fn build_session_displays(
+    store: &SqliteStore,
+    hits: &[search::SessionHit],
+) -> anyhow::Result<Vec<SessionDisplay>> {
+    let mut out = Vec::with_capacity(hits.len());
+    for hit in hits {
+        let Some(session) = store.get_session(&hit.session_id)? else {
+            continue;
+        };
+        let messages = store.get_session_messages(&hit.session_id)?;
+        let message_count = messages.len();
+        let title = session_title(&session, &messages);
+        let snippet = truncate_text(&hit.top_content, 140);
+        let match_text = format!(
+            "{} {} {} {}",
+            title,
+            session.id,
+            snippet,
+            session.agent.as_str()
+        );
+        out.push(SessionDisplay {
+            session_id: session.id.clone(),
+            title,
+            agent: session.agent.as_str().to_string(),
+            updated_at: session.updated_at,
+            message_count,
+            snippet,
+            score: hit.score,
+            match_text,
+        });
+    }
+    Ok(out)
+}
+
+fn session_title(session: &Session, messages: &[Message]) -> String {
+    let title = session.title.trim();
+    if !title.is_empty() {
+        return title.to_string();
+    }
+    messages
+        .iter()
+        .find(|m| m.role == "user")
+        .map(|m| truncate_text(&m.content, 60))
+        .unwrap_or_else(|| "Untitled session".to_string())
+}
+
+fn prompt_line(prompt: &str) -> anyhow::Result<String> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf)?;
+    Ok(buf.trim_end().to_string())
+}
+
+fn parse_index(input: &str, len: usize) -> anyhow::Result<usize> {
+    if input.trim().is_empty() {
+        return Ok(0);
+    }
+    let idx: usize = input.trim().parse().with_context(|| "invalid index")?;
+    if idx >= len {
+        return Err(anyhow::anyhow!("index out of range"));
+    }
+    Ok(idx)
+}
+
+fn print_session_list(items: &[SessionDisplay]) {
+    for (i, item) in items.iter().enumerate() {
+        println!(
+            "[{i}] {} | {} | {} msgs | {} | {}",
+            item.title,
+            item.agent,
+            item.message_count,
+            item.updated_at.to_rfc3339(),
+            item.snippet
+        );
+    }
+}
+
+fn fuzzy_filter_sessions(items: &[SessionDisplay], query: &str) -> Vec<SessionDisplay> {
+    let matcher = SkimMatcherV2::default();
+    let mut scored: Vec<(i64, SessionDisplay)> = items
+        .iter()
+        .filter_map(|item| {
+            matcher
+                .fuzzy_match(&item.match_text, query)
+                .map(|s| (s, item.clone()))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.into_iter().map(|(_, item)| item).collect()
+}
+
+fn truncate_text(input: &str, max: usize) -> String {
+    let mut out = String::new();
+    for (i, ch) in input.chars().enumerate() {
+        if i >= max {
+            out.push_str("...");
+            return out;
         }
-        SyncPhase::Saving { message_count } => {
-            eprintln!("[{name}] saving {message_count} messages...")
-        }
-        SyncPhase::Done { total_records } => eprintln!("[{name}] done: {total_records} records"),
-    })
+        out.push(ch);
+    }
+    out
+}
+
+fn render_session_html(session: &Session, messages: &[Message]) -> String {
+    let title = escape_html(&session.title);
+    let mut body = String::new();
+    body.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
+    body.push_str("<style>body{font-family:system-ui,Arial,sans-serif;max-width:900px;margin:2rem auto;line-height:1.5}h1{font-size:1.6rem} .meta{color:#555;font-size:.9rem;margin-bottom:1rem} .msg{padding:.6rem .8rem;border:1px solid #e3e3e3;border-radius:8px;margin:.6rem 0} .role{font-weight:600;margin-bottom:.4rem} pre{white-space:pre-wrap}</style></head><body>");
+    body.push_str(&format!("<h1>{}</h1>", title));
+    body.push_str(&format!(
+        "<div class=\"meta\">Session {} · {} · {} messages</div>",
+        escape_html(&session.id),
+        escape_html(session.agent.as_str()),
+        messages.len()
+    ));
+    for msg in messages {
+        let role = escape_html(&msg.role);
+        let ts = escape_html(&msg.ts.to_rfc3339());
+        let content = escape_html(&msg.content);
+        body.push_str("<div class=\"msg\">");
+        body.push_str(&format!("<div class=\"role\">{} · {}</div>", role, ts));
+        body.push_str(&format!("<pre>{}</pre>", content));
+        body.push_str("</div>");
+    }
+    body.push_str("</body></html>");
+    body
+}
+
+fn render_session_markdown(session: &Session, messages: &[Message]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# {}\n\n", session.title));
+    out.push_str(&format!(
+        "Session `{}` · `{}` · {} messages\n\n",
+        session.id,
+        session.agent.as_str(),
+        messages.len()
+    ));
+    for msg in messages {
+        out.push_str(&format!("## {} ({})\n\n", msg.role, msg.ts.to_rfc3339()));
+        out.push_str(&msg.content);
+        out.push_str("\n\n");
+    }
+    out
+}
+
+fn escape_html(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn resolve_output_dir(dir: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    let base = if let Some(dir) = dir {
+        dir
+    } else {
+        dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("remi")
+            .join("exports")
+    };
+    std::fs::create_dir_all(&base)
+        .with_context(|| format!("creating output dir {}", base.display()))?;
+    Ok(base)
 }

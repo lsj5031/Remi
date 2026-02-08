@@ -26,6 +26,7 @@ serde = { workspace = true, features = ["derive"] }
 toml = "0.8"
 dirs = { workspace = true }
 embeddings = { path = "../embeddings", optional = true }
+fuzzy-matcher = "0.3"
 
 [features]
 semantic = ["dep:embeddings", "ingest/semantic", "search/semantic", "store-sqlite/semantic"]

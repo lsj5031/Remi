@@ -51,16 +51,10 @@ impl AgentAdapter for ClaudeAdapter {
                     .filter(|l| !l.trim().is_empty())
                     .filter_map(|line| {
                         let mut val: Value = serde_json::from_str(line).ok()?;
-                        let ts =
-                            adapter_common::extract_ts(&val).unwrap_or_else(chrono::Utc::now);
+                        let ts = adapter_common::extract_ts(&val).unwrap_or_else(chrono::Utc::now);
                         if let Some(obj) = val.as_object_mut() {
-                            obj.insert(
-                                "__source_path".to_string(),
-                                Value::String(path.clone()),
-                            );
-                            if !obj.contains_key("sessionId")
-                                && !obj.contains_key("sessionID")
-                            {
+                            obj.insert("__source_path".to_string(), Value::String(path.clone()));
+                            if !obj.contains_key("sessionId") && !obj.contains_key("sessionID") {
                                 obj.insert(
                                     "__session_seed".to_string(),
                                     Value::String(stem.clone()),

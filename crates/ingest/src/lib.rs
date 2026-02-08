@@ -14,8 +14,7 @@ pub enum SyncPhase {
 pub fn sync_adapter(
     adapter: &dyn AgentAdapter,
     store: &mut SqliteStore,
-    #[cfg(feature = "semantic")]
-    embedder: Option<&mut embeddings::Embedder>,
+    #[cfg(feature = "semantic")] embedder: Option<&mut embeddings::Embedder>,
     on_progress: impl Fn(SyncPhase),
 ) -> anyhow::Result<usize> {
     on_progress(SyncPhase::Discovering);
@@ -138,7 +137,7 @@ mod tests {
         };
         let mut store = SqliteStore::open(":memory:").unwrap();
         store.init_schema().unwrap();
-        
+
         #[cfg(feature = "semantic")]
         let count = sync_adapter(&adapter, &mut store, None, |_| {}).unwrap();
         #[cfg(not(feature = "semantic"))]
@@ -192,5 +191,4 @@ mod tests {
         assert_eq!(count, 0);
         assert!(store.get_checkpoint("pi").unwrap().is_none());
     }
-
 }

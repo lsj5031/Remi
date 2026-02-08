@@ -50,14 +50,8 @@ pub fn load_jsonl(
                     let mut val: Value = serde_json::from_str(line).ok()?;
                     let ts = extract_ts(&val).unwrap_or_else(Utc::now);
                     if let Some(obj) = val.as_object_mut() {
-                        obj.insert(
-                            "__source_path".to_string(),
-                            Value::String(path.clone()),
-                        );
-                        obj.insert(
-                            "__session_seed".to_string(),
-                            Value::String(stem.clone()),
-                        );
+                        obj.insert("__source_path".to_string(), Value::String(path.clone()));
+                        obj.insert("__session_seed".to_string(), Value::String(stem.clone()));
                     }
                     let source_id = val
                         .get("id")
@@ -445,9 +439,21 @@ mod tests {
         let dir = tempdir();
         let file = dir.join("sess.jsonl");
         let mut f = std::fs::File::create(&file).unwrap();
-        writeln!(f, r#"{{"id":"aaa","timestamp":"2025-01-10T00:00:00+00:00"}}"#).unwrap();
-        writeln!(f, r#"{{"id":"mmm","timestamp":"2025-01-10T00:00:00+00:00"}}"#).unwrap();
-        writeln!(f, r#"{{"id":"zzz","timestamp":"2025-01-10T00:00:00+00:00"}}"#).unwrap();
+        writeln!(
+            f,
+            r#"{{"id":"aaa","timestamp":"2025-01-10T00:00:00+00:00"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"id":"mmm","timestamp":"2025-01-10T00:00:00+00:00"}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"id":"zzz","timestamp":"2025-01-10T00:00:00+00:00"}}"#
+        )
+        .unwrap();
         let paths = vec![file.to_str().unwrap().to_string()];
         let cursor = "2025-01-10T00:00:00+00:00\x1fmmm".to_string();
         let records = load_jsonl(&paths, Some(&cursor)).unwrap();

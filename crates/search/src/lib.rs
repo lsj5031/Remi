@@ -13,12 +13,19 @@ pub struct RankedHit {
     pub score: f32,
 }
 
+#[derive(Debug, Clone)]
+pub struct SessionHit {
+    pub session_id: String,
+    pub top_message_id: String,
+    pub top_content: String,
+    pub score: f32,
+}
+
 pub fn search(
     store: &SqliteStore,
     query: &str,
     limit: usize,
-    #[cfg(feature = "semantic")]
-    embedder: Option<&mut Embedder>,
+    #[cfg(feature = "semantic")] embedder: Option<&mut Embedder>,
 ) -> anyhow::Result<Vec<RankedHit>> {
     let fts_query = sanitize_fts_query(query);
 
@@ -85,7 +92,12 @@ pub fn search(
         scores
             .entry(row.message_id.clone())
             .and_modify(|(s, _, _, _)| *s += rrf)
-            .or_insert((rrf, row.session_id.clone(), row.content.clone(), row.message_id.clone()));
+            .or_insert((
+                rrf,
+                row.session_id.clone(),
+                row.content.clone(),
+                row.message_id.clone(),
+            ));
     }
 
     for (rank, row) in recency_rows.iter().enumerate() {
@@ -93,7 +105,12 @@ pub fn search(
         scores
             .entry(row.message_id.clone())
             .and_modify(|(s, _, _, _)| *s += rrf)
-            .or_insert((rrf, row.session_id.clone(), row.content.clone(), row.message_id.clone()));
+            .or_insert((
+                rrf,
+                row.session_id.clone(),
+                row.content.clone(),
+                row.message_id.clone(),
+            ));
     }
 
     #[cfg(feature = "semantic")]
@@ -124,7 +141,53 @@ pub fn search(
 
     out.sort_by(|a, b| b.score.total_cmp(&a.score));
     out.truncate(limit);
-    
+
+    Ok(out)
+}
+
+pub fn search_sessions(
+    store: &SqliteStore,
+    query: &str,
+    limit: usize,
+    #[cfg(feature = "semantic")] embedder: Option<&mut Embedder>,
+) -> anyhow::Result<Vec<SessionHit>> {
+    let hits = search(
+        store,
+        query,
+        limit * 5,
+        #[cfg(feature = "semantic")]
+        embedder,
+    )?;
+
+    let mut grouped: HashMap<String, (f32, f32, String, String)> = HashMap::new();
+    for hit in hits {
+        grouped
+            .entry(hit.session_id.clone())
+            .and_modify(|(total, top_score, top_id, top_content)| {
+                *total += hit.score;
+                if hit.score > *top_score {
+                    *top_score = hit.score;
+                    *top_id = hit.message_id.clone();
+                    *top_content = hit.content.clone();
+                }
+            })
+            .or_insert((hit.score, hit.score, hit.message_id, hit.content));
+    }
+
+    let mut out: Vec<SessionHit> = grouped
+        .into_iter()
+        .map(
+            |(session_id, (score, _top_score, top_message_id, top_content))| SessionHit {
+                session_id,
+                top_message_id,
+                top_content,
+                score,
+            },
+        )
+        .collect();
+
+    out.sort_by(|a, b| b.score.total_cmp(&a.score));
+    out.truncate(limit);
     Ok(out)
 }
 
@@ -136,7 +199,12 @@ fn sanitize_fts_query(query: &str) -> String {
             let cleaned: String = t
                 .chars()
                 .filter(|c| {
-                    c.is_alphanumeric() || *c == '_' || *c == '.' || *c == '/' || *c == ':' || *c == '-'
+                    c.is_alphanumeric()
+                        || *c == '_'
+                        || *c == '.'
+                        || *c == '/'
+                        || *c == ':'
+                        || *c == '-'
                 })
                 .collect();
             if cleaned.is_empty() {
@@ -155,7 +223,11 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
-    if norm_a < 1e-6 || norm_b < 1e-6 { 0.0 } else { dot / (norm_a * norm_b) }
+    if norm_a < 1e-6 || norm_b < 1e-6 {
+        0.0
+    } else {
+        dot / (norm_a * norm_b)
+    }
 }
 
 #[cfg(test)]
@@ -235,6 +307,19 @@ mod tests {
         for w in hits.windows(2) {
             assert!(w[0].score >= w[1].score);
         }
+    }
+
+    #[test]
+    fn search_sessions_groups_hits() {
+        let store = setup_store();
+        #[cfg(feature = "semantic")]
+        let sessions = search_sessions(&store, "rust", 10, None).unwrap();
+        #[cfg(not(feature = "semantic"))]
+        let sessions = search_sessions(&store, "rust", 10).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "s1");
+        assert!(sessions[0].score > 0.0);
+        assert_eq!(sessions[0].top_message_id, "m1");
     }
 
     #[test]
