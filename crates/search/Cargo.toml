@@ -6,6 +6,12 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+store-sqlite = { path = "../store-sqlite" }
+embeddings = { path = "../embeddings", optional = true }
+
+[features]
+semantic = ["dep:embeddings", "store-sqlite/semantic"]
+
+[dev-dependencies]
 chrono.workspace = true
 core-model = { path = "../core-model" }
-store-sqlite = { path = "../store-sqlite" }

@@ -109,6 +109,12 @@ impl SqliteStore {
               FOREIGN KEY(run_id) REFERENCES archive_runs(id) ON DELETE CASCADE,
               FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS message_embeddings (
+              message_id TEXT PRIMARY KEY,
+              dim INTEGER NOT NULL,
+              vec BLOB NOT NULL,
+              FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
+            );
             CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
               message_id UNINDEXED,
               session_id UNINDEXED,
@@ -233,6 +239,33 @@ impl SqliteStore {
         Ok(())
     }
 
+    #[cfg(feature = "semantic")]
+    pub fn save_embedding(&self, message_id: &str, vec: &[f32]) -> anyhow::Result<()> {
+        let dim = vec.len() as i64;
+        let blob: Vec<u8> = vec.iter().flat_map(|f| f.to_le_bytes()).collect();
+        self.conn.execute(
+            "INSERT INTO message_embeddings (message_id, dim, vec) VALUES (?1, ?2, ?3) ON CONFLICT(message_id) DO UPDATE SET dim=excluded.dim, vec=excluded.vec",
+            params![message_id, dim, blob],
+        )?;
+        Ok(())
+    }
+
+    #[cfg(feature = "semantic")]
+    pub fn load_all_embeddings(&self) -> anyhow::Result<Vec<(String, Vec<f32>)>> {
+        let mut stmt = self.conn.prepare("SELECT message_id, vec FROM message_embeddings")?;
+        let rows = stmt.query_map([], |r| {
+            let id: String = r.get(0)?;
+            let blob: Vec<u8> = r.get(1)?;
+            let vec: Vec<f32> = blob
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            Ok((id, vec))
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
+
     pub fn get_checkpoint(&self, agent: &str) -> anyhow::Result<Option<String>> {
         self.conn
             .query_row(
@@ -290,6 +323,26 @@ impl SqliteStore {
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    #[cfg(feature = "semantic")]
+    pub fn get_message(&self, message_id: &str) -> anyhow::Result<Option<Message>> {
+        self.conn
+            .query_row(
+                "SELECT id, session_id, role, content, ts FROM messages WHERE id = ?1",
+                params![message_id],
+                |r| {
+                    Ok(Message {
+                        id: r.get(0)?,
+                        session_id: r.get(1)?,
+                        role: r.get(2)?,
+                        content: r.get(3)?,
+                        ts: parse_ts(r.get(4)?),
+                    })
+                },
+            )
+            .optional()
             .map_err(Into::into)
     }
 

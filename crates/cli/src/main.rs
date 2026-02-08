@@ -5,6 +5,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use ingest::SyncPhase;
 use store_sqlite::SqliteStore;
 
+#[cfg(feature = "semantic")]
+mod config;
+
 #[derive(Parser)]
 #[command(name = "remi")]
 #[command(about = "Unified coding-agent session memory")]
@@ -28,6 +31,11 @@ enum Commands {
     Archive {
         #[command(subcommand)]
         command: ArchiveCommand,
+    },
+    #[cfg(feature = "semantic")]
+    Embed {
+        #[arg(long)]
+        rebuild: bool,
     },
     Doctor,
 }
@@ -84,11 +92,30 @@ enum ArchiveCommand {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    #[cfg(feature = "semantic")]
+    let config = config::Config::load()?;
     let t = Instant::now();
 
     eprintln!("opening database...");
     let mut store = SqliteStore::open_default()?;
     store.init_schema()?;
+
+    #[cfg(feature = "semantic")]
+    let mut embedder = if let Some(semantic) = &config.semantic {
+        if semantic.enabled {
+            if let Some(path) = &semantic.model_path {
+                 eprintln!("loading embedding model from {}...", path);
+                 Some(embeddings::Embedder::new(path, semantic.pooling.as_deref(), semantic.query_prefix.as_deref())?)
+            } else {
+                 eprintln!("warning: semantic search enabled but no model_path configured; skipping");
+                 None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     match cli.command {
         Commands::Init => {
@@ -96,16 +123,46 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Sync(args) => {
             let synced = match args.agent {
-                AgentOpt::Pi => sync_one("pi", &pi::PiAdapter, &mut store)?,
-                AgentOpt::Droid => sync_one("droid", &droid::DroidAdapter, &mut store)?,
+                AgentOpt::Pi => sync_one(
+                    "pi", 
+                    &pi::PiAdapter, 
+                    &mut store,
+                    #[cfg(feature = "semantic")]
+                    embedder.as_mut()
+                )?,
+                AgentOpt::Droid => sync_one(
+                    "droid", 
+                    &droid::DroidAdapter, 
+                    &mut store,
+                    #[cfg(feature = "semantic")]
+                    embedder.as_mut()
+                )?,
                 AgentOpt::Opencode => {
-                    sync_one("opencode", &opencode::OpenCodeAdapter, &mut store)?
+                    sync_one(
+                        "opencode", 
+                        &opencode::OpenCodeAdapter, 
+                        &mut store,
+                        #[cfg(feature = "semantic")]
+                        embedder.as_mut()
+                    )?
                 }
-                AgentOpt::Claude => sync_one("claude", &claude::ClaudeAdapter, &mut store)?,
+                AgentOpt::Claude => sync_one(
+                    "claude", 
+                    &claude::ClaudeAdapter, 
+                    &mut store,
+                    #[cfg(feature = "semantic")]
+                    embedder.as_mut()
+                )?,
                 AgentOpt::All => {
                     let mut total = 0;
                     for (name, adapter) in adapters() {
-                        total += sync_one(name, adapter.as_ref(), &mut store)?;
+                        total += sync_one(
+                            name, 
+                            adapter.as_ref(), 
+                            &mut store,
+                            #[cfg(feature = "semantic")]
+                            embedder.as_mut()
+                        )?;
                     }
                     total
                 }
@@ -131,7 +188,13 @@ fn main() -> anyhow::Result<()> {
         Commands::Search { command } => match command {
             SearchCommand::Query { query } => {
                 eprintln!("searching for \"{}\"...", query);
-                let hits = search::search(&store, &query, 20)?;
+                let hits = search::search(
+                    &store, 
+                    &query, 
+                    20,
+                    #[cfg(feature = "semantic")]
+                    embedder.as_mut()
+                )?;
                 eprintln!("{} results in {:.1?}", hits.len(), t.elapsed());
                 for hit in &hits {
                     println!("{:.3} {} {}", hit.score, hit.session_id, hit.content);
@@ -181,6 +244,34 @@ fn main() -> anyhow::Result<()> {
                 println!("{msg}");
             }
         },
+        #[cfg(feature = "semantic")]
+        Commands::Embed { rebuild } => {
+            if let Some(embedder) = embedder.as_mut() {
+                if rebuild {
+                     eprintln!("rebuilding embeddings...");
+                     let sessions = store.list_sessions()?;
+                     let mut count = 0;
+                     for s in &sessions {
+                         let msgs = store.get_session_messages(&s.id)?;
+                         for m in msgs {
+                             if m.content.trim().is_empty() { continue; }
+                             if let Ok(vec) = embedder.embed(&m.content, false) {
+                                 store.save_embedding(&m.id, &vec)?;
+                                 count += 1;
+                             }
+                         }
+                         if count > 0 && count % 100 == 0 {
+                             eprintln!("processed {} messages...", count);
+                         }
+                     }
+                     eprintln!("computed {} embeddings in {:.1?}", count, t.elapsed());
+                } else {
+                    eprintln!("use --rebuild to rebuild all embeddings");
+                }
+            } else {
+                eprintln!("semantic search not enabled or configured");
+            }
+        }
         Commands::Doctor => {
             eprintln!("running integrity check...");
             let check = store.integrity_check()?;
@@ -207,8 +298,13 @@ fn sync_one(
     name: &str,
     adapter: &dyn core_model::AgentAdapter,
     store: &mut SqliteStore,
+    #[cfg(feature = "semantic")]
+    embedder: Option<&mut embeddings::Embedder>,
 ) -> anyhow::Result<usize> {
-    ingest::sync_adapter(adapter, store, |phase| match phase {
+    ingest::sync_adapter(adapter, store, 
+        #[cfg(feature = "semantic")]
+        embedder,
+        |phase| match phase {
         SyncPhase::Discovering => eprintln!("[{name}] discovering source files..."),
         SyncPhase::Scanning { file_count } => eprintln!("[{name}] scanning {file_count} files..."),
         SyncPhase::Normalizing { record_count } => {

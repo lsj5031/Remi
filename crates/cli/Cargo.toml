@@ -22,3 +22,10 @@ opencode = { path = "../adapters/opencode" }
 pi = { path = "../adapters/pi" }
 search = { path = "../search" }
 store-sqlite = { path = "../store-sqlite" }
+serde = { workspace = true, features = ["derive"] }
+toml = "0.8"
+dirs = { workspace = true }
+embeddings = { path = "../embeddings", optional = true }
+
+[features]
+semantic = ["dep:embeddings", "ingest/semantic", "search/semantic", "store-sqlite/semantic"]

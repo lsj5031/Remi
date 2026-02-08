@@ -10,6 +10,7 @@ members = [
   "crates/adapters/opencode",
   "crates/adapters/claude",
   "crates/adapters/common",
+  "crates/embeddings",
   "crates/cli",
 ]
 resolver = "2"

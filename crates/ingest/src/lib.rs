@@ -14,6 +14,8 @@ pub enum SyncPhase {
 pub fn sync_adapter(
     adapter: &dyn AgentAdapter,
     store: &mut SqliteStore,
+    #[cfg(feature = "semantic")]
+    embedder: Option<&mut embeddings::Embedder>,
     on_progress: impl Fn(SyncPhase),
 ) -> anyhow::Result<usize> {
     on_progress(SyncPhase::Discovering);
@@ -38,6 +40,17 @@ pub fn sync_adapter(
     });
 
     store.save_batch(&batch)?;
+
+    #[cfg(feature = "semantic")]
+    if let Some(embedder) = embedder {
+        for msg in &batch.messages {
+            // Best effort embedding
+            if let Ok(vec) = embedder.embed(&msg.content, false) {
+                // Ignore error on save (e.g. if too large or whatever, though save_embedding shouldn't fail easily)
+                let _ = store.save_embedding(&msg.id, &vec);
+            }
+        }
+    }
 
     if let Some(cursor) = adapter.checkpoint_cursor(&records) {
         store.upsert_checkpoint(&Checkpoint {
@@ -125,7 +138,12 @@ mod tests {
         };
         let mut store = SqliteStore::open(":memory:").unwrap();
         store.init_schema().unwrap();
+        
+        #[cfg(feature = "semantic")]
+        let count = sync_adapter(&adapter, &mut store, None, |_| {}).unwrap();
+        #[cfg(not(feature = "semantic"))]
         let count = sync_adapter(&adapter, &mut store, |_| {}).unwrap();
+
         assert_eq!(count, 1);
         let sessions = store.list_sessions().unwrap();
         assert_eq!(sessions.len(), 1);
@@ -144,8 +162,18 @@ mod tests {
         };
         let mut store = SqliteStore::open(":memory:").unwrap();
         store.init_schema().unwrap();
-        sync_adapter(&adapter, &mut store, |_| {}).unwrap();
-        sync_adapter(&adapter, &mut store, |_| {}).unwrap();
+
+        #[cfg(feature = "semantic")]
+        {
+            sync_adapter(&adapter, &mut store, None, |_| {}).unwrap();
+            sync_adapter(&adapter, &mut store, None, |_| {}).unwrap();
+        }
+        #[cfg(not(feature = "semantic"))]
+        {
+            sync_adapter(&adapter, &mut store, |_| {}).unwrap();
+            sync_adapter(&adapter, &mut store, |_| {}).unwrap();
+        }
+
         let sessions = store.list_sessions().unwrap();
         assert_eq!(sessions.len(), 1);
     }
@@ -155,7 +183,12 @@ mod tests {
         let adapter = FakeAdapter { records: vec![] };
         let mut store = SqliteStore::open(":memory:").unwrap();
         store.init_schema().unwrap();
+
+        #[cfg(feature = "semantic")]
+        let count = sync_adapter(&adapter, &mut store, None, |_| {}).unwrap();
+        #[cfg(not(feature = "semantic"))]
         let count = sync_adapter(&adapter, &mut store, |_| {}).unwrap();
+
         assert_eq!(count, 0);
         assert!(store.get_checkpoint("pi").unwrap().is_none());
     }

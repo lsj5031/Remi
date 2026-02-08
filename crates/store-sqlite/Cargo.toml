@@ -11,3 +11,6 @@ core-model = { path = "../core-model" }
 dirs.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
+
+[features]
+semantic = []

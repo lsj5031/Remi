@@ -128,12 +128,12 @@ If brute-force cosine exceeds 100ms on the target corpus, consider:
   messages).
 
 ## Implementation order
-1. Repo bootstrap + workspace + SQLite schema/migrations.
-2. Ingestion engine + checkpoints + provenance.
-3. All four adapters (ingest first).
-4. FTS search with recency ranking.
-5. Archive planner/executor + restore.
-6. Hardening: idempotency, corruption, scale tests.
+- [x] 1. Repo bootstrap + workspace + SQLite schema/migrations.
+- [x] 2. Ingestion engine + checkpoints + provenance.
+- [x] 3. All four adapters (ingest first).
+- [x] 4. FTS search with recency ranking.
+- [x] 5. Archive planner/executor + restore.
+- [ ] 6. Hardening: idempotency, corruption, scale tests.
 
 ## Acceptance criteria
 - Fresh `Remi` repo builds/tests cleanly.
