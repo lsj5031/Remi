@@ -1,0 +1,11 @@
+[package]
+name = "search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+core-model = { path = "../core-model" }
+store-sqlite = { path = "../store-sqlite" }
