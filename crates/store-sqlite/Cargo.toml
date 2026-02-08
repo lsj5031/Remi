@@ -1,0 +1,13 @@
+[package]
+name = "store-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+core-model = { path = "../core-model" }
+dirs.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
