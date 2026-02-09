@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --workspace --release
+
+      - name: Prepare simple artifact
+        run: |
+          mkdir -p dist/simple
+          cp target/release/remi dist/simple/
+          tar -czf remi-linux-x64-simple.tar.gz -C dist/simple .
+
+      - name: Prepare bundled artifact
+        run: |
+          set -euo pipefail
+          mkdir -p dist/bundled/bin dist/bundled/models dist/bundled/runtime
+          cp target/release/remi dist/bundled/bin/
+
+          ORT_VERSION=1.23.0
+          ORT_TGZ=onnxruntime-linux-x64-${ORT_VERSION}.tgz
+          curl -L -o /tmp/${ORT_TGZ} https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ORT_TGZ}
+          tar -xzf /tmp/${ORT_TGZ} -C /tmp
+          mkdir -p dist/bundled/runtime/onnxruntime
+          cp -R /tmp/onnxruntime-linux-x64-${ORT_VERSION} dist/bundled/runtime/onnxruntime/
+
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip huggingface_hub
+          .venv/bin/python - <<'PY'
+          from huggingface_hub import snapshot_download
+          snapshot_download(
+              repo_id="BAAI/bge-small-en-v1.5",
+              local_dir="dist/bundled/models/bge-small-en-v1.5",
+              local_dir_use_symlinks=False,
+          )
+          PY
+
+          if [ -f dist/bundled/models/bge-small-en-v1.5/onnx/model.onnx ] && [ ! -f dist/bundled/models/bge-small-en-v1.5/model.onnx ]; then
+            cp dist/bundled/models/bge-small-en-v1.5/onnx/model.onnx dist/bundled/models/bge-small-en-v1.5/model.onnx
+          fi
+
+          rm -rf dist/bundled/models/bge-small-en-v1.5/.cache
+          tar -czf remi-linux-x64-bundled.tar.gz -C dist/bundled .
+
+      - name: Upload release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            remi-linux-x64-simple.tar.gz
+            remi-linux-x64-bundled.tar.gz

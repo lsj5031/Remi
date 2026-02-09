@@ -21,6 +21,12 @@ mod config;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
+    #[cfg(feature = "semantic")]
+    #[arg(long)]
+    ort_dylib_path: Option<PathBuf>,
+    #[cfg(feature = "semantic")]
+    #[arg(long, default_value_t = false)]
+    auto_ort: bool,
 }
 
 #[derive(Subcommand)]
@@ -149,6 +155,9 @@ fn main() -> anyhow::Result<()> {
     let config = config::Config::load()?;
     let t = Instant::now();
 
+    #[cfg(feature = "semantic")]
+    configure_ort(&cli)?;
+
     eprintln!("opening database...");
     let mut store = SqliteStore::open_default()?;
     store.init_schema()?;
@@ -156,8 +165,13 @@ fn main() -> anyhow::Result<()> {
     #[cfg(feature = "semantic")]
     let mut embedder = if let Some(semantic) = &config.semantic {
         if semantic.enabled {
-            if let Some(path) = &semantic.model_path {
-                eprintln!("loading embedding model from {}...", path);
+            let model_path = semantic
+                .model_path
+                .as_ref()
+                .map(PathBuf::from)
+                .or_else(detect_model_path);
+            if let Some(path) = model_path {
+                eprintln!("loading embedding model from {}...", path.display());
                 Some(embeddings::Embedder::new(
                     path,
                     semantic.pooling.as_deref(),
@@ -405,6 +419,81 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "semantic")]
+fn configure_ort(cli: &Cli) -> anyhow::Result<()> {
+    if let Some(path) = &cli.ort_dylib_path {
+        if !path.exists() {
+            return Err(anyhow::anyhow!("ORT dylib not found at {}", path.display()));
+        }
+        std::env::set_var("ORT_DYLIB_PATH", path);
+        return Ok(());
+    }
+
+    if cli.auto_ort {
+        if std::env::var_os("ORT_DYLIB_PATH").is_some() {
+            return Ok(());
+        }
+        if let Some(found) = find_ort_dylib()? {
+            eprintln!("using ORT dylib at {}", found.display());
+            std::env::set_var("ORT_DYLIB_PATH", found);
+        } else {
+            eprintln!("warning: failed to auto-detect libonnxruntime.so");
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "semantic")]
+fn find_ort_dylib() -> anyhow::Result<Option<PathBuf>> {
+    let mut roots = Vec::new();
+    if let Some(cache_dir) = dirs::cache_dir() {
+        roots.push(cache_dir.join("onnxruntime"));
+    }
+    roots.push(PathBuf::from("/usr/lib"));
+    roots.push(PathBuf::from("/usr/local/lib"));
+
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for root in roots {
+        if !root.exists() {
+            continue;
+        }
+        for path in walk_paths(&root)? {
+            if path.file_name().and_then(|s| s.to_str()) == Some("libonnxruntime.so") {
+                let modified = std::fs::metadata(&path)
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                if best.as_ref().is_none_or(|(t, _)| modified > *t) {
+                    best = Some((modified, path));
+                }
+            }
+        }
+    }
+
+    Ok(best.map(|(_, path)| path))
+}
+
+#[cfg(feature = "semantic")]
+fn walk_paths(root: &std::path::Path) -> anyhow::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn adapters() -> Vec<(&'static str, Box<dyn core_model::AgentAdapter>)> {
     vec![
         ("pi", Box::new(pi::PiAdapter)),
@@ -610,4 +699,29 @@ fn resolve_output_dir(dir: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(&base)
         .with_context(|| format!("creating output dir {}", base.display()))?;
     Ok(base)
+}
+
+#[cfg(feature = "semantic")]
+fn detect_model_path() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("models").join("bge-small-en-v1.5"));
+            candidates.push(dir.join("model"));
+        }
+    }
+    if let Some(cache_dir) = dirs::cache_dir() {
+        candidates.push(cache_dir.join("remi").join("bge-small-en-v1.5"));
+    }
+
+    for path in candidates {
+        let model = path.join("model.onnx");
+        let tokenizer = path.join("tokenizer.json");
+        if model.exists() && tokenizer.exists() {
+            eprintln!("auto-detected model at {}", path.display());
+            return Some(path);
+        }
+    }
+
+    None
 }

@@ -10,9 +10,12 @@
 - [x] **Tier 2: Semantic Search**:
     - Optional `embeddings` crate (ONNX/`ort`).
     - Configurable via `~/.config/remi/config.toml`.
+    - Auto-detects model under `models/bge-small-en-v1.5` or `~/.cache/remi/bge-small-en-v1.5`.
+    - `--ort-dylib-path` / `--auto-ort` for ONNX Runtime loading.
     - Integrated into `ingest` and `search`.
     - `remi embed --rebuild` command.
 - [x] **CLI**: `remi` command with `init`, `sync`, `sessions`, `search`, `archive`, `embed`, `doctor`.
+- [x] **Release**: GitHub Actions workflow builds simple + bundled artifacts.
 
 ## Verification
 - `cargo check --workspace` passes (including `--features semantic`).

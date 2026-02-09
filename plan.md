@@ -60,27 +60,35 @@ Capability-based archival fallback:
 - Reciprocal Rank Fusion (RRF) combining BM25 relevance + recency signals.
 - FTS query sanitization (terms quoted, joined with OR) for safety.
 - Substring fallback (LIKE) when FTS returns zero results.
+- Two-layer search UX: session list first, then render selected session to HTML/Markdown.
 
 ## CLI commands
 - `remi init`
 - `remi sync --agent <pi|droid|opencode|claude|all>`
 - `remi sessions list|show`
 - `remi search query "..."`
+  - `--format <html|markdown>` (default `html`)
+  - `--no-interactive` (skip list/select)
+  - `--output-dir <path>`
+  - `--semantic <auto|on|off>` (feature-gated)
 - `remi archive plan --older-than <dur> --keep-latest <n>`
 - `remi archive run --plan <id> --dry-run`
 - `remi archive run --plan <id> --execute --delete-source`
 - `remi archive restore --bundle <path>`
 - `remi doctor`
+- `remi embed --rebuild` (feature-gated)
 
-## Tier 2: Optional local embeddings (future)
-Gate behind `--features semantic` cargo feature flag. Do not implement until
-BM25 + RRF demonstrably fails on real queries where wording diverges from
-stored messages (e.g. "caching" vs "memoization").
+## Global flags (semantic builds)
+- `--ort-dylib-path <path>`
+- `--auto-ort` (auto-detect `libonnxruntime.so`)
+
+## Tier 2: Optional local embeddings (implemented)
+Gate behind `--features semantic` cargo feature flag.
 
 ### Model
-- all-MiniLM-L6-v2 ONNX (~23 MB, 384 dims, CPU-only, sub-50ms per query).
-- User supplies model path via `REMI_EMBED_MODEL` env var or `--model` flag;
-  no auto-download.
+- BGE `bge-small-en-v1.5` ONNX (~134 MB). Configured via `~/.config/remi/config.toml`.
+- Auto-detects model under `models/bge-small-en-v1.5` next to the binary or
+  `~/.cache/remi/bge-small-en-v1.5` when `model_path` is missing.
 
 ### Dependencies
 - `ort` crate (ONNX Runtime Rust bindings) behind the `semantic` feature.
@@ -98,11 +106,7 @@ CREATE TABLE IF NOT EXISTS message_embeddings (
 Store vectors as raw `f32` little-endian blobs (`dim * 4` bytes).
 
 ### Ingest changes
-- In `sync_adapter`, after `save_batch`, if the semantic feature is enabled
-  and a model is loaded, compute embeddings for new messages in batches of 64
-  and call `store.save_embeddings_blob()`.
-- Add a `remi embed --rebuild` CLI command to backfill embeddings for all
-  existing messages.
+- `remi embed --rebuild` backfills embeddings for all existing messages.
 
 ### Search changes (in `search::search()`)
 - Embed the query string once.
@@ -126,6 +130,11 @@ If brute-force cosine exceeds 100ms on the target corpus, consider:
   embeddings are available.
 - Embedding computation is idempotent (re-sync does not recompute unchanged
   messages).
+
+## Release artifacts
+- Simple bundle: `remi` binary only.
+- Bundled: `remi` + `libonnxruntime.so` + `bge-small-en-v1.5` under `models/`.
+- GitHub Actions workflow: `.github/workflows/release.yml`.
 
 ## Implementation order
 - [x] 1. Repo bootstrap + workspace + SQLite schema/migrations.

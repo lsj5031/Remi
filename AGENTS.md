@@ -22,6 +22,10 @@ Rust workspace (edition 2024) with a CLI binary (`crates/cli`) backed by library
 - SQLite WAL mode + prepared statement caching.
 - Composite cursor (`{ts}\x1f{source_id}`) for correct incremental sync without data loss.
 
+## CLI notes
+- Search renders a session list first, then exports the chosen session to HTML/Markdown.
+- Semantic builds accept `--semantic <auto|on|off>`, `--ort-dylib-path`, and `--auto-ort`.
+
 ## Code style
 - Errors: `anyhow::Result` for app-level, `thiserror` for library error enums.
 - Serde derives on all model types. IDs are deterministic blake3 hashes (`deterministic_id`).
