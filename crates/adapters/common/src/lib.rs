@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, time::SystemTime};
 
 use chrono::{DateTime, TimeZone, Utc};
 use core_model::{AgentKind, NativeRecord, NormalizedBatch, deterministic_id};
@@ -27,6 +27,11 @@ pub fn collect_files_with_ext(root: &Path, ext: &str) -> Vec<String> {
     out
 }
 
+pub fn file_mtime(path: &str) -> Option<DateTime<Utc>> {
+    let modified: SystemTime = fs::metadata(path).ok()?.modified().ok()?;
+    Some(DateTime::<Utc>::from(modified))
+}
+
 pub fn load_jsonl(
     source_paths: &[String],
     cursor: Option<&str>,
@@ -35,6 +40,13 @@ pub fn load_jsonl(
     let mut out: Vec<NativeRecord> = source_paths
         .par_iter()
         .flat_map(|path| {
+            let file_mtime = file_mtime(path);
+            if let Some(ref cur) = parsed_cursor
+                && let Some(mtime) = file_mtime
+                && mtime <= cur.ts
+            {
+                return Vec::new();
+            }
             let stem = Path::new(path)
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -48,7 +60,7 @@ pub fn load_jsonl(
                 .filter(|l| !l.trim().is_empty())
                 .filter_map(|line| {
                     let mut val: Value = serde_json::from_str(line).ok()?;
-                    let ts = extract_ts(&val).unwrap_or_else(Utc::now);
+                    let ts = extract_ts(&val).or(file_mtime).unwrap_or_else(Utc::now);
                     if let Some(obj) = val.as_object_mut() {
                         obj.insert("__source_path".to_string(), Value::String(path.clone()));
                         obj.insert("__session_seed".to_string(), Value::String(stem.clone()));
@@ -459,6 +471,36 @@ mod tests {
         let records = load_jsonl(&paths, Some(&cursor)).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].source_id, "zzz");
+    }
+
+    #[test]
+    fn load_jsonl_falls_back_to_file_mtime() {
+        let dir = tempdir();
+        let file = dir.join("sess.jsonl");
+        let mut f = std::fs::File::create(&file).unwrap();
+        f.write_all(br#"{"id":"1","type":"message","message":{"content":[{"text":"hello"}]}}"#)
+            .unwrap();
+        f.write_all(b"\n").unwrap();
+        let mtime = file_mtime(file.to_str().unwrap()).unwrap();
+        let paths = vec![file.to_str().unwrap().to_string()];
+        let records = load_jsonl(&paths, None).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].updated_at, mtime);
+    }
+
+    #[test]
+    fn load_jsonl_skips_when_cursor_at_or_after_mtime() {
+        let dir = tempdir();
+        let file = dir.join("sess.jsonl");
+        let mut f = std::fs::File::create(&file).unwrap();
+        f.write_all(br#"{"id":"1","type":"message","message":{"content":[{"text":"hello"}]}}"#)
+            .unwrap();
+        f.write_all(b"\n").unwrap();
+        let mtime = file_mtime(file.to_str().unwrap()).unwrap();
+        let cursor = encode_cursor(mtime, "zzz");
+        let paths = vec![file.to_str().unwrap().to_string()];
+        let records = load_jsonl(&paths, Some(&cursor)).unwrap();
+        assert!(records.is_empty());
     }
 
     #[test]

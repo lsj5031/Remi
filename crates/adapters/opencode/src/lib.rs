@@ -115,9 +115,16 @@ fn load_message_json(
     let mut out: Vec<NativeRecord> = source_paths
         .par_iter()
         .filter_map(|path| {
+            let file_mtime = adapter_common::file_mtime(path);
+            if let Some(ref cur) = parsed_cursor
+                && let Some(mtime) = file_mtime
+                && mtime <= cur.ts
+            {
+                return None;
+            }
             let content = fs::read_to_string(path).ok()?;
             let mut val: Value = serde_json::from_str(&content).ok()?;
-            let ts = extract_ts(&val).unwrap_or_else(Utc::now);
+            let ts = extract_ts(&val).or(file_mtime).unwrap_or_else(Utc::now);
             let source_id = val
                 .get("id")
                 .and_then(Value::as_str)
