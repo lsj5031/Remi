@@ -19,6 +19,16 @@ remi sync --agent all
 remi search query "error"
 ```
 
+Filter and select in non-interactive mode:
+```bash
+remi search query "remi build" --no-interactive --agent droid --select auto --format json
+```
+
+Interactive fuzzy filter supports field prefixes:
+```text
+agent:claude title:auth login
+```
+
 ## Semantic search (optional)
 
 Enable in `~/.config/remi/config.toml`:

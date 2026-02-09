@@ -6,7 +6,8 @@ use core_model::{
     ArchiveItem, ArchiveRun, Checkpoint, Message, NormalizedBatch, Provenance, Session,
     deterministic_id,
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
+use std::{collections::BTreeSet, time::Instant};
 
 pub struct SqliteStore {
     conn: Connection,
@@ -139,6 +140,16 @@ impl SqliteStore {
     }
 
     pub fn save_batch(&mut self, batch: &NormalizedBatch) -> anyhow::Result<()> {
+        let started = Instant::now();
+        let mut last = started;
+        eprintln!(
+            "[store] save_batch start: sessions={}, messages={}, events={}, artifacts={}, provenance={}",
+            batch.sessions.len(),
+            batch.messages.len(),
+            batch.events.len(),
+            batch.artifacts.len(),
+            batch.provenance.len()
+        );
         let tx = self.conn.transaction()?;
         {
             let mut stmt_session = tx.prepare_cached(
@@ -161,6 +172,13 @@ impl SqliteStore {
                 ])?;
             }
         }
+        let now = Instant::now();
+        eprintln!(
+            "[store] sessions upserted in {:.1?} (+{:.1?})",
+            now.duration_since(started),
+            now.duration_since(last)
+        );
+        last = now;
         {
             let mut stmt_msg = tx.prepare_cached(
                 r#"INSERT INTO messages (id, session_id, role, content, ts)
@@ -180,17 +198,39 @@ impl SqliteStore {
                 ])?;
             }
         }
+        let now = Instant::now();
+        eprintln!(
+            "[store] messages upserted in {:.1?} (+{:.1?})",
+            now.duration_since(started),
+            now.duration_since(last)
+        );
+        last = now;
         {
-            let mut stmt_fts_del =
-                tx.prepare_cached("DELETE FROM fts_messages WHERE message_id = ?1")?;
-            let mut stmt_fts_ins = tx.prepare_cached(
-                "INSERT INTO fts_messages (message_id, session_id, content, ts) VALUES (?1, ?2, ?3, ?4)",
-            )?;
+            let mut sessions = BTreeSet::new();
             for m in &batch.messages {
-                stmt_fts_del.execute(params![m.id])?;
-                stmt_fts_ins.execute(params![m.id, m.session_id, m.content, m.ts.to_rfc3339()])?;
+                sessions.insert(m.session_id.clone());
+            }
+            if !sessions.is_empty() {
+                let placeholders = std::iter::repeat_n("?", sessions.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let delete_sql =
+                    format!("DELETE FROM fts_messages WHERE session_id IN ({placeholders})");
+                tx.execute(&delete_sql, params_from_iter(sessions.iter()))?;
+                let insert_sql = format!(
+                    "INSERT INTO fts_messages (message_id, session_id, content, ts) \
+                    SELECT id, session_id, content, ts FROM messages WHERE session_id IN ({placeholders})"
+                );
+                tx.execute(&insert_sql, params_from_iter(sessions.iter()))?;
             }
         }
+        let now = Instant::now();
+        eprintln!(
+            "[store] fts updated in {:.1?} (+{:.1?})",
+            now.duration_since(started),
+            now.duration_since(last)
+        );
+        last = now;
         {
             let mut stmt_event = tx.prepare_cached(
                 r#"INSERT INTO events (id, session_id, kind, payload, ts)
@@ -207,6 +247,13 @@ impl SqliteStore {
                 ])?;
             }
         }
+        let now = Instant::now();
+        eprintln!(
+            "[store] events upserted in {:.1?} (+{:.1?})",
+            now.duration_since(started),
+            now.duration_since(last)
+        );
+        last = now;
         {
             let mut stmt_artifact = tx.prepare_cached(
                 r#"INSERT INTO artifacts (id, session_id, path, checksum, metadata)
@@ -223,6 +270,13 @@ impl SqliteStore {
                 ])?;
             }
         }
+        let now = Instant::now();
+        eprintln!(
+            "[store] artifacts upserted in {:.1?} (+{:.1?})",
+            now.duration_since(started),
+            now.duration_since(last)
+        );
+        last = now;
         {
             let mut stmt_prov = tx.prepare_cached(
                 r#"INSERT INTO provenance (id, entity_type, entity_id, agent, source_path, source_id)
@@ -240,7 +294,19 @@ impl SqliteStore {
                 ])?;
             }
         }
+        let now = Instant::now();
+        eprintln!(
+            "[store] provenance upserted in {:.1?} (+{:.1?})",
+            now.duration_since(started),
+            now.duration_since(last)
+        );
+        let commit_start = Instant::now();
         tx.commit()?;
+        eprintln!(
+            "[store] commit done in {:.1?} (total {:.1?})",
+            commit_start.elapsed(),
+            started.elapsed()
+        );
         Ok(())
     }
 

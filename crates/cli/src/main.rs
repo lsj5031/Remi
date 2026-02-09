@@ -1,5 +1,6 @@
 use std::{
-    io::{self, Write},
+    cell::RefCell,
+    io::{self, IsTerminal, Write},
     path::PathBuf,
     time::Instant,
 };
@@ -10,6 +11,8 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use core_model::{Message, Session};
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use ingest::SyncPhase;
+use owo_colors::OwoColorize;
+use serde::Serialize;
 use store_sqlite::SqliteStore;
 
 #[cfg(feature = "semantic")]
@@ -82,6 +85,18 @@ enum SearchCommand {
         format: SearchFormat,
         #[arg(long, default_value_t = false)]
         no_interactive: bool,
+        #[arg(long, value_enum, default_value_t = SelectMode::Auto)]
+        select: SelectMode,
+        #[arg(long)]
+        index: Option<usize>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        contains: Option<String>,
         #[cfg(feature = "semantic")]
         #[arg(long, value_enum, default_value_t = SemanticMode::Auto)]
         semantic: SemanticMode,
@@ -118,6 +133,13 @@ enum ArchiveCommand {
 enum SearchFormat {
     Html,
     Markdown,
+    Json,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum SelectMode {
+    Auto,
+    Index,
 }
 
 #[cfg(feature = "semantic")]
@@ -133,6 +155,7 @@ impl SearchFormat {
         match self {
             SearchFormat::Html => "html",
             SearchFormat::Markdown => "md",
+            SearchFormat::Json => "json",
         }
     }
 }
@@ -147,6 +170,33 @@ struct SessionDisplay {
     snippet: String,
     score: f32,
     match_text: String,
+}
+
+#[derive(Default, Clone)]
+struct FilterSpec {
+    agent: Option<String>,
+    title: Option<String>,
+    id: Option<String>,
+    contains: Option<String>,
+}
+
+#[derive(Serialize)]
+struct JsonSession {
+    id: String,
+    title: String,
+    agent: String,
+    updated_at: DateTime<Utc>,
+    message_count: usize,
+    snippet: String,
+    score: f32,
+}
+
+#[derive(Serialize)]
+struct JsonSearchOutput {
+    query: String,
+    selected_index: usize,
+    selected_session_id: String,
+    sessions: Vec<JsonSession>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -196,28 +246,28 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Sync(args) => {
             let synced = match args.agent {
-                AgentOpt::Pi => sync_one(
+                AgentOpt::Pi => sync_with_timing(
                     "pi",
                     &pi::PiAdapter,
                     &mut store,
                     #[cfg(feature = "semantic")]
                     embedder.as_mut(),
                 )?,
-                AgentOpt::Droid => sync_one(
+                AgentOpt::Droid => sync_with_timing(
                     "droid",
                     &droid::DroidAdapter,
                     &mut store,
                     #[cfg(feature = "semantic")]
                     embedder.as_mut(),
                 )?,
-                AgentOpt::Opencode => sync_one(
+                AgentOpt::Opencode => sync_with_timing(
                     "opencode",
                     &opencode::OpenCodeAdapter,
                     &mut store,
                     #[cfg(feature = "semantic")]
                     embedder.as_mut(),
                 )?,
-                AgentOpt::Claude => sync_one(
+                AgentOpt::Claude => sync_with_timing(
                     "claude",
                     &claude::ClaudeAdapter,
                     &mut store,
@@ -227,7 +277,7 @@ fn main() -> anyhow::Result<()> {
                 AgentOpt::All => {
                     let mut total = 0;
                     for (name, adapter) in adapters() {
-                        total += sync_one(
+                        total += sync_with_timing(
                             name,
                             adapter.as_ref(),
                             &mut store,
@@ -261,6 +311,12 @@ fn main() -> anyhow::Result<()> {
                 query,
                 format,
                 no_interactive,
+                select,
+                index,
+                agent,
+                title,
+                id,
+                contains,
                 #[cfg(feature = "semantic")]
                 semantic,
                 output_dir,
@@ -296,27 +352,78 @@ fn main() -> anyhow::Result<()> {
                     return Ok(());
                 }
 
-                let selected = if no_interactive {
-                    sessions.sort_by(|a, b| b.score.total_cmp(&a.score));
-                    sessions[0].clone()
+                let filters = FilterSpec {
+                    agent,
+                    title,
+                    id,
+                    contains,
+                };
+                sessions = apply_filters(&sessions, &filters);
+                if sessions.is_empty() {
+                    return Err(anyhow::anyhow!("no sessions matched filters"));
+                }
+
+                let (selected, selected_index, sessions) = if no_interactive {
+                    let selected_index = match select {
+                        SelectMode::Auto => {
+                            sessions.sort_by(|a, b| b.score.total_cmp(&a.score));
+                            0
+                        }
+                        SelectMode::Index => {
+                            index.with_context(|| "--index required when --select index")?
+                        }
+                    };
+                    if selected_index >= sessions.len() {
+                        return Err(anyhow::anyhow!("index out of range"));
+                    }
+                    let selected = sessions[selected_index].clone();
+                    (selected, selected_index, sessions)
                 } else {
                     eprintln!("{} sessions matched in {:.1?}", sessions.len(), t.elapsed());
-                    print_session_list(&sessions);
-                    let filter = prompt_line("filter (fuzzy, enter to keep): ")?;
-                    let filtered = if filter.trim().is_empty() {
-                        sessions
+                    print_session_list(&sessions, &[]);
+                    let filter = prompt_line(
+                        "filter (fuzzy; fields: agent:, title:, id:, contains:; example: \"agent:claude auth login\") — enter to keep: ",
+                    )?;
+                    let (mut filtered, terms) = if filter.trim().is_empty() {
+                        (sessions.clone(), Vec::new())
                     } else {
                         fuzzy_filter_sessions(&sessions, &filter)
                     };
                     if filtered.is_empty() {
-                        eprintln!("no sessions matched filter");
-                        return Ok(());
+                        eprintln!("no sessions matched filter; keeping original list");
+                        filtered = sessions.clone();
+                    } else {
+                        eprintln!("{} sessions matched filter", filtered.len());
                     }
-                    print_session_list(&filtered);
+                    print_session_list(&filtered, &terms);
                     let choice = prompt_line("select index (default 0): ")?;
-                    let index = parse_index(&choice, filtered.len())?;
-                    filtered[index].clone()
+                    let selected_index = parse_index(&choice, filtered.len())?;
+                    let selected = filtered[selected_index].clone();
+                    (selected, selected_index, filtered)
                 };
+
+                if matches!(format, SearchFormat::Json) {
+                    let sessions = sessions
+                        .into_iter()
+                        .map(|item| JsonSession {
+                            id: item.session_id,
+                            title: item.title,
+                            agent: item.agent,
+                            updated_at: item.updated_at,
+                            message_count: item.message_count,
+                            snippet: item.snippet,
+                            score: item.score,
+                        })
+                        .collect();
+                    let output = JsonSearchOutput {
+                        query: query.clone(),
+                        selected_index,
+                        selected_session_id: selected.session_id.clone(),
+                        sessions,
+                    };
+                    println!("{}", serde_json::to_string_pretty(&output)?);
+                    return Ok(());
+                }
 
                 let session = store
                     .get_session(&selected.session_id)?
@@ -325,6 +432,7 @@ fn main() -> anyhow::Result<()> {
                 let rendered = match format {
                     SearchFormat::Html => render_session_html(&session, &messages),
                     SearchFormat::Markdown => render_session_markdown(&session, &messages),
+                    SearchFormat::Json => unreachable!("handled earlier"),
                 };
                 let out_dir = resolve_output_dir(output_dir)?;
                 let file_path =
@@ -503,30 +611,91 @@ fn adapters() -> Vec<(&'static str, Box<dyn core_model::AgentAdapter>)> {
     ]
 }
 
+fn sync_with_timing(
+    name: &str,
+    adapter: &dyn core_model::AgentAdapter,
+    store: &mut SqliteStore,
+    #[cfg(feature = "semantic")] embedder: Option<&mut embeddings::Embedder>,
+) -> anyhow::Result<usize> {
+    let started = Instant::now();
+    eprintln!("[{name}] sync start...");
+    let count = sync_one(
+        name,
+        adapter,
+        store,
+        #[cfg(feature = "semantic")]
+        embedder,
+    )?;
+    eprintln!(
+        "[{name}] sync done in {:.1?} ({count} records)",
+        started.elapsed()
+    );
+    Ok(count)
+}
+
 fn sync_one(
     name: &str,
     adapter: &dyn core_model::AgentAdapter,
     store: &mut SqliteStore,
     #[cfg(feature = "semantic")] embedder: Option<&mut embeddings::Embedder>,
 ) -> anyhow::Result<usize> {
+    let started = Instant::now();
+    let last = RefCell::new(started);
     ingest::sync_adapter(
         adapter,
         store,
         #[cfg(feature = "semantic")]
         embedder,
         |phase| match phase {
-            SyncPhase::Discovering => eprintln!("[{name}] discovering source files..."),
+            SyncPhase::Discovering => {
+                let now = Instant::now();
+                let since_last = now.duration_since(*last.borrow());
+                *last.borrow_mut() = now;
+                eprintln!(
+                    "[{name}] discovering source files... ({:.1?} since start, +{:.1?})",
+                    started.elapsed(),
+                    since_last
+                );
+            }
             SyncPhase::Scanning { file_count } => {
-                eprintln!("[{name}] scanning {file_count} files...")
+                let now = Instant::now();
+                let since_last = now.duration_since(*last.borrow());
+                *last.borrow_mut() = now;
+                eprintln!(
+                    "[{name}] scanning {file_count} files... ({:.1?} since start, +{:.1?})",
+                    started.elapsed(),
+                    since_last
+                );
             }
             SyncPhase::Normalizing { record_count } => {
-                eprintln!("[{name}] normalizing {record_count} records...")
+                let now = Instant::now();
+                let since_last = now.duration_since(*last.borrow());
+                *last.borrow_mut() = now;
+                eprintln!(
+                    "[{name}] normalizing {record_count} records... ({:.1?} since start, +{:.1?})",
+                    started.elapsed(),
+                    since_last
+                );
             }
             SyncPhase::Saving { message_count } => {
-                eprintln!("[{name}] saving {message_count} messages...")
+                let now = Instant::now();
+                let since_last = now.duration_since(*last.borrow());
+                *last.borrow_mut() = now;
+                eprintln!(
+                    "[{name}] saving {message_count} messages... ({:.1?} since start, +{:.1?})",
+                    started.elapsed(),
+                    since_last
+                );
             }
             SyncPhase::Done { total_records } => {
-                eprintln!("[{name}] done: {total_records} records")
+                let now = Instant::now();
+                let since_last = now.duration_since(*last.borrow());
+                *last.borrow_mut() = now;
+                eprintln!(
+                    "[{name}] done: {total_records} records ({:.1?} since start, +{:.1?})",
+                    started.elapsed(),
+                    since_last
+                );
             }
         },
     )
@@ -579,7 +748,11 @@ fn session_title(session: &Session, messages: &[Message]) -> String {
 }
 
 fn prompt_line(prompt: &str) -> anyhow::Result<String> {
-    print!("{prompt}");
+    if color_enabled() {
+        print!("{}", prompt.cyan());
+    } else {
+        print!("{prompt}");
+    }
     io::stdout().flush()?;
     let mut buf = String::new();
     io::stdin().read_line(&mut buf)?;
@@ -597,31 +770,179 @@ fn parse_index(input: &str, len: usize) -> anyhow::Result<usize> {
     Ok(idx)
 }
 
-fn print_session_list(items: &[SessionDisplay]) {
+fn print_session_list(items: &[SessionDisplay], terms: &[String]) {
+    let use_color = color_enabled();
     for (i, item) in items.iter().enumerate() {
+        let title = highlight_terms(&item.title, terms, use_color);
+        let agent = highlight_terms(&item.agent, terms, use_color);
+        let snippet = highlight_terms(&item.snippet, terms, use_color);
+        let date = item.updated_at.to_rfc3339();
+        let count = format!("{} msgs", item.message_count);
+        let separator = if use_color {
+            " | ".dimmed().to_string()
+        } else {
+            " | ".to_string()
+        };
+        let title = if use_color {
+            title.bold().to_string()
+        } else {
+            title
+        };
+        let agent = if use_color {
+            agent.cyan().to_string()
+        } else {
+            agent
+        };
+        let count = if use_color {
+            count.magenta().to_string()
+        } else {
+            count
+        };
+        let date = if use_color {
+            date.dimmed().to_string()
+        } else {
+            date
+        };
+        let snippet = if use_color {
+            snippet.dimmed().to_string()
+        } else {
+            snippet
+        };
         println!(
-            "[{i}] {} | {} | {} msgs | {} | {}",
-            item.title,
-            item.agent,
-            item.message_count,
-            item.updated_at.to_rfc3339(),
-            item.snippet
+            "[{i}] {title}{separator}{agent}{separator}{count}{separator}{date}{separator}{snippet}"
         );
     }
 }
 
-fn fuzzy_filter_sessions(items: &[SessionDisplay], query: &str) -> Vec<SessionDisplay> {
+fn fuzzy_filter_sessions(
+    items: &[SessionDisplay],
+    query: &str,
+) -> (Vec<SessionDisplay>, Vec<String>) {
+    let (filters, terms) = parse_fuzzy_query(query);
+    let filtered = apply_filters(items, &filters);
+    if terms.is_empty() {
+        return (filtered, terms);
+    }
     let matcher = SkimMatcherV2::default();
-    let mut scored: Vec<(i64, SessionDisplay)> = items
+    let mut scored: Vec<(i64, SessionDisplay)> = filtered
         .iter()
         .filter_map(|item| {
-            matcher
-                .fuzzy_match(&item.match_text, query)
-                .map(|s| (s, item.clone()))
+            let mut total = 0i64;
+            for term in &terms {
+                let score = matcher.fuzzy_match(&item.match_text, term)?;
+                total += score;
+            }
+            Some((total, item.clone()))
         })
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0));
-    scored.into_iter().map(|(_, item)| item).collect()
+    (scored.into_iter().map(|(_, item)| item).collect(), terms)
+}
+
+fn parse_fuzzy_query(input: &str) -> (FilterSpec, Vec<String>) {
+    let mut filters = FilterSpec::default();
+    let mut terms = Vec::new();
+    for raw in input.split_whitespace() {
+        let Some((key, value)) = raw.split_once(':') else {
+            terms.push(raw.to_string());
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        match key {
+            "agent" => filters.agent = Some(value.to_string()),
+            "title" => filters.title = Some(value.to_string()),
+            "id" => filters.id = Some(value.to_string()),
+            "contains" => filters.contains = Some(value.to_string()),
+            _ => terms.push(raw.to_string()),
+        }
+    }
+    (filters, terms)
+}
+
+fn apply_filters(items: &[SessionDisplay], filters: &FilterSpec) -> Vec<SessionDisplay> {
+    let agent = filters.agent.as_ref().map(|s| s.to_lowercase());
+    let title = filters.title.as_ref().map(|s| s.to_lowercase());
+    let id = filters.id.as_ref().map(|s| s.to_lowercase());
+    let contains = filters.contains.as_ref().map(|s| s.to_lowercase());
+    items
+        .iter()
+        .filter(|item| {
+            if let Some(agent) = agent.as_ref()
+                && !item.agent.to_lowercase().contains(agent)
+            {
+                return false;
+            }
+            if let Some(title) = title.as_ref()
+                && !item.title.to_lowercase().contains(title)
+            {
+                return false;
+            }
+            if let Some(id) = id.as_ref()
+                && !item.session_id.to_lowercase().contains(id)
+            {
+                return false;
+            }
+            if let Some(contains) = contains.as_ref()
+                && !item.match_text.to_lowercase().contains(contains)
+            {
+                return false;
+            }
+            true
+        })
+        .cloned()
+        .collect()
+}
+
+fn color_enabled() -> bool {
+    io::stdout().is_terminal()
+        && io::stderr().is_terminal()
+        && std::env::var_os("NO_COLOR").is_none()
+}
+
+fn highlight_terms(text: &str, terms: &[String], use_color: bool) -> String {
+    if !use_color || terms.is_empty() {
+        return text.to_string();
+    }
+    let mut ranges = Vec::new();
+    for term in terms {
+        if term.is_empty() {
+            continue;
+        }
+        for (start, _) in text.match_indices(term) {
+            ranges.push((start, start + term.len()));
+        }
+    }
+    if ranges.is_empty() {
+        return text.to_string();
+    }
+    ranges.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in ranges {
+        if let Some(last) = merged.last_mut()
+            && start <= last.1
+        {
+            last.1 = last.1.max(end);
+            continue;
+        }
+        merged.push((start, end));
+    }
+    let mut out = String::new();
+    let mut cursor = 0;
+    for (start, end) in merged {
+        if cursor < start {
+            out.push_str(&text[cursor..start]);
+        }
+        let slice = &text[start..end];
+        out.push_str(&slice.yellow().bold().to_string());
+        cursor = end;
+    }
+    if cursor < text.len() {
+        out.push_str(&text[cursor..]);
+    }
+    out
 }
 
 fn truncate_text(input: &str, max: usize) -> String {

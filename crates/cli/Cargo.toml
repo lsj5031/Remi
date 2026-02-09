@@ -23,9 +23,11 @@ pi = { path = "../adapters/pi" }
 search = { path = "../search" }
 store-sqlite = { path = "../store-sqlite" }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 toml = "0.8"
 dirs = { workspace = true }
 embeddings = { path = "../embeddings", optional = true }
+owo-colors = "4"
 fuzzy-matcher = "0.3"
 
 [features]
