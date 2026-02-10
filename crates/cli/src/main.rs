@@ -68,6 +68,7 @@ enum AgentOpt {
     Droid,
     Opencode,
     Claude,
+    Amp,
     All,
 }
 
@@ -270,6 +271,13 @@ fn main() -> anyhow::Result<()> {
                 AgentOpt::Claude => sync_with_timing(
                     "claude",
                     &claude::ClaudeAdapter,
+                    &mut store,
+                    #[cfg(feature = "semantic")]
+                    embedder.as_mut(),
+                )?,
+                AgentOpt::Amp => sync_with_timing(
+                    "amp",
+                    &amp::AmpAdapter,
                     &mut store,
                     #[cfg(feature = "semantic")]
                     embedder.as_mut(),
@@ -608,6 +616,7 @@ fn adapters() -> Vec<(&'static str, Box<dyn core_model::AgentAdapter>)> {
         ("droid", Box::new(droid::DroidAdapter)),
         ("opencode", Box::new(opencode::OpenCodeAdapter)),
         ("claude", Box::new(claude::ClaudeAdapter)),
+        ("amp", Box::new(amp::AmpAdapter)),
     ]
 }
 

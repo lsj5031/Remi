@@ -14,6 +14,7 @@ archive = { path = "../archive" }
 chrono.workspace = true
 clap.workspace = true
 claude = { path = "../adapters/claude" }
+amp = { path = "../adapters/amp" }
 core-model = { path = "../core-model" }
 droid = { path = "../adapters/droid" }
 humantime.workspace = true

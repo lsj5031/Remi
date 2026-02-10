@@ -1,6 +1,6 @@
 # Remi
 
-Unified coding-agent session memory for **Pi**, **Factory Droid**, **OpenCode**, and **Claude Code**.
+Unified coding-agent session memory for **Pi**, **Factory Droid**, **OpenCode**, **Claude Code**, and **Amp**.
 
 Remi ingests local agent transcripts into one SQLite database, keeps sync state with checkpoints, supports ranked search, and provides safe archive/restore workflows.
 
@@ -32,6 +32,7 @@ Remi ingests local agent transcripts into one SQLite database, keeps sync state 
 - **Incremental sync** from multiple coding-agent sources.
 - **Deterministic IDs** (`blake3`) for idempotent upserts.
 - **Checkpointed ingestion** using a composite cursor (`timestamp + source_id`) to avoid missing same-timestamp records.
+- **Structured content normalization** including tool-call/tool-result payloads into searchable text.
 - **Lexical search** using SQLite FTS5 + BM25.
 - **Ranking fusion** with recency via Reciprocal Rank Fusion (RRF).
 - **Substring fallback** when lexical matches are empty.
@@ -84,6 +85,7 @@ Remi currently discovers and ingests from:
 | Factory Droid | `~/.factory/sessions/**/*.jsonl`, `~/.local/share/factory-droid/sessions/**/*.jsonl` |
 | OpenCode | `~/.local/share/opencode/storage/message/**/*.json` (+ part text from `~/.local/share/opencode/storage/part/<message_id>/*.json`) |
 | Claude Code | `~/.claude/transcripts/**/*.jsonl`, `~/.claude/projects/**/*.jsonl`, `~/.local/share/claude-code/**/*.jsonl` |
+| Amp | `~/.local/share/amp/threads/**/*.json` |
 
 ---
 
@@ -93,7 +95,7 @@ Top-level commands:
 
 ```text
 remi init
-remi sync --agent <pi|droid|opencode|claude|all>
+remi sync --agent <pi|droid|opencode|claude|amp|all>
 remi sessions <list|show>
 remi search query <QUERY> [options]
 remi archive <plan|run|restore>
@@ -123,6 +125,7 @@ remi sync --agent pi
 remi sync --agent droid
 remi sync --agent opencode
 remi sync --agent claude
+remi sync --agent amp
 remi sync --agent all
 ```
 
@@ -448,7 +451,7 @@ Workspace crates:
 - `search`: lexical + recency (+ optional semantic) ranking
 - `archive`: plan/run/restore archive workflows
 - `adapter-common` (at `crates/adapters/common`): shared file/JSON parsing + cursor logic
-- `adapters/{pi,droid,opencode,claude}`: per-agent ingestion adapters
+- `adapters/{pi,droid,opencode,claude,amp}`: per-agent ingestion adapters
 - `embeddings` (optional): ONNX + tokenizer embedding generation
 - `cli`: `remi` command-line interface
 

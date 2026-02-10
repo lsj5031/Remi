@@ -130,6 +130,7 @@ impl SqliteStore {
             ("droid", "droid"),
             ("opencode", "opencode"),
             ("claude", "claude"),
+            ("amp", "amp"),
         ] {
             self.conn.execute(
                 "INSERT OR IGNORE INTO agents (id, name) VALUES (?1, ?2)",
@@ -620,6 +621,7 @@ fn parse_agent(s: &str) -> core_model::AgentKind {
         "droid" => core_model::AgentKind::Droid,
         "opencode" => core_model::AgentKind::OpenCode,
         "claude" => core_model::AgentKind::Claude,
+        "amp" => core_model::AgentKind::Amp,
         _ => core_model::AgentKind::OpenCode,
     }
 }
@@ -684,7 +686,7 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(*) FROM agents", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 4);
+        assert_eq!(count, 5);
     }
 
     #[test]
@@ -835,7 +837,7 @@ mod tests {
             .conn
             .query_row("SELECT COUNT(*) FROM agents", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(count, 4);
+        assert_eq!(count, 5);
     }
 
     #[test]

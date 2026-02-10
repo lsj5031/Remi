@@ -8,6 +8,7 @@ pub enum AgentKind {
     Droid,
     OpenCode,
     Claude,
+    Amp,
 }
 
 impl AgentKind {
@@ -17,6 +18,7 @@ impl AgentKind {
             AgentKind::Droid => "droid",
             AgentKind::OpenCode => "opencode",
             AgentKind::Claude => "claude",
+            AgentKind::Amp => "amp",
         }
     }
 }
@@ -168,5 +170,6 @@ mod tests {
         assert_eq!(AgentKind::Droid.as_str(), "droid");
         assert_eq!(AgentKind::OpenCode.as_str(), "opencode");
         assert_eq!(AgentKind::Claude.as_str(), "claude");
+        assert_eq!(AgentKind::Amp.as_str(), "amp");
     }
 }

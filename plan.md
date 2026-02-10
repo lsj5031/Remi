@@ -1,8 +1,8 @@
-Create a brand-new repository in a new directory named `Remi` and implement a Rust CLI that unifies session storage for Pi, Factory Droid, OpenCode, and Claude Code, with incremental sync, searchable memory, and safe archival.
+Create a brand-new repository in a new directory named `Remi` and implement a Rust CLI that unifies session storage for Pi, Factory Droid, OpenCode, Claude Code, and Amp, with incremental sync, searchable memory, and safe archival.
 
 ## Scope you requested
 - Start in a **fresh repo**: `Remi/`.
-- Unified persistent memory for all four coding agents.
+- Unified persistent memory for all five coding agents.
 - Queryable by any agent.
 - Incremental ingestion with checkpoints.
 - Archive old sessions with default dry-run and optional hard-delete once validated.
@@ -19,6 +19,7 @@ Create a brand-new repository in a new directory named `Remi` and implement a Ru
    - `crates/adapters/droid`
    - `crates/adapters/opencode`
    - `crates/adapters/claude`
+   - `crates/adapters/amp`
    - `crates/cli`
 3. CI basics: fmt, clippy, tests.
 4. Repo hygiene: `.gitignore`, MIT/Apache-2 dual license (or your preferred one).
@@ -64,7 +65,7 @@ Capability-based archival fallback:
 
 ## CLI commands
 - `remi init`
-- `remi sync --agent <pi|droid|opencode|claude|all>`
+- `remi sync --agent <pi|droid|opencode|claude|amp|all>`
 - `remi sessions list|show`
 - `remi search query "..."`
   - `--format <html|markdown>` (default `html`)
@@ -139,7 +140,7 @@ If brute-force cosine exceeds 100ms on the target corpus, consider:
 ## Implementation order
 - [x] 1. Repo bootstrap + workspace + SQLite schema/migrations.
 - [x] 2. Ingestion engine + checkpoints + provenance.
-- [x] 3. All four adapters (ingest first).
+- [x] 3. All five adapters (ingest first).
 - [x] 4. FTS search with recency ranking.
 - [x] 5. Archive planner/executor + restore.
 - [ ] 6. Hardening: idempotency, corruption, scale tests.

@@ -9,6 +9,7 @@ members = [
   "crates/adapters/droid",
   "crates/adapters/opencode",
   "crates/adapters/claude",
+  "crates/adapters/amp",
   "crates/adapters/common",
   "crates/embeddings",
   "crates/cli",
