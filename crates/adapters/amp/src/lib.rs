@@ -127,8 +127,9 @@ fn normalize_records(kind: AgentKind, records: &[NativeRecord]) -> NormalizedBat
             agent: kind,
             source_path: rec
                 .payload
-                .get("__source_path")
+                .get("__workspace_path")
                 .and_then(Value::as_str)
+                .or_else(|| rec.payload.get("__source_path").and_then(Value::as_str))
                 .unwrap_or(kind.as_str())
                 .to_string(),
             source_id: rec.source_id.clone(),
@@ -178,6 +179,7 @@ fn load_thread_json(
                     .or_else(|| val.get("createdAt"))
                     .and_then(extract_timestamp)
             });
+            let workspace_path = extract_workspace_path(&val);
             let usage_index = build_usage_ledger_index(&val);
 
             let messages = val.get("messages").and_then(Value::as_array);
@@ -225,6 +227,12 @@ fn load_thread_json(
                         );
                     }
                     obj.insert("__source_path".to_string(), Value::String(path.clone()));
+                    if let Some(workspace_path) = &workspace_path {
+                        obj.insert(
+                            "__workspace_path".to_string(),
+                            Value::String(workspace_path.clone()),
+                        );
+                    }
 
                     Some(NativeRecord {
                         source_id,
@@ -256,6 +264,31 @@ fn parse_thread_id(thread: &Value, path: &str) -> String {
         .filter(|s| !s.trim().is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| deterministic_id(&["amp", "thread", path]))
+}
+
+fn extract_workspace_path(thread: &Value) -> Option<String> {
+    let trees = thread
+        .get("env")
+        .and_then(|env| env.get("initial"))
+        .and_then(|initial| initial.get("trees"))
+        .and_then(Value::as_array)?;
+
+    for tree in trees {
+        let Some(uri) = tree.get("uri").and_then(Value::as_str) else {
+            continue;
+        };
+        if uri.is_empty() {
+            continue;
+        }
+        if let Some(path) = uri.strip_prefix("file://") {
+            if !path.is_empty() {
+                return Some(path.to_string());
+            }
+            continue;
+        }
+        return Some(uri.to_string());
+    }
+    None
 }
 
 fn parse_message_id(message: &Value, idx: usize, thread_id: &str) -> String {
@@ -469,7 +502,8 @@ mod tests {
             "__thread_id": "T-1",
             "__thread_title": "My Thread",
             "__thread_ts": ts.to_rfc3339(),
-            "__source_path": "/tmp/T-1.json"
+            "__source_path": "/tmp/T-1.json",
+            "__workspace_path": "/home/leo/code/Remi"
         });
         let rec = NativeRecord {
             source_id: "T-1:0".to_string(),
@@ -485,6 +519,7 @@ mod tests {
         );
         assert_eq!(batch.sessions[0].source_ref, "T-1");
         assert_eq!(batch.messages[0].content, "hello");
+        assert_eq!(batch.provenance[0].source_path, "/home/leo/code/Remi");
     }
 
     #[test]
@@ -500,6 +535,23 @@ mod tests {
         let id2 = parse_message_id(&fallback, 2, "thread");
         assert_eq!(id1, id2);
         assert_ne!(id1, "2");
+    }
+
+    #[test]
+    fn extract_workspace_path_from_thread_env_tree_uri() {
+        let thread = serde_json::json!({
+            "env": {
+                "initial": {
+                    "trees": [
+                        {"uri": "file:///home/leo/code/Remi", "displayName": "Remi"}
+                    ]
+                }
+            }
+        });
+        assert_eq!(
+            extract_workspace_path(&thread).as_deref(),
+            Some("/home/leo/code/Remi")
+        );
     }
 
     #[test]

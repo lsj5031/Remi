@@ -21,6 +21,7 @@ Remi ingests local agent transcripts into one SQLite database, keeps sync state 
   - [`remi doctor`](#remi-doctor)
 - [Semantic search (optional feature)](#semantic-search-optional-feature)
 - [End-to-end workflow examples](#end-to-end-workflow-examples)
+- [Helper scripts (examples)](#helper-scripts-examples)
 - [Architecture at a glance](#architecture-at-a-glance)
 - [Release artifacts](#release-artifacts)
 - [License](#license)
@@ -438,6 +439,47 @@ Restore when needed:
 ```bash
 remi archive restore --bundle ~/.local/share/remi/archive/<run_id>/sessions.json
 ```
+
+---
+
+## Helper scripts (examples)
+
+This repo includes helper scripts in `scripts/`:
+
+- `scripts/remi-diary.sh` — generate a daily Markdown summary from `remi.db`, with optional Telegram send.
+- `scripts/markie-export.sh` — render Markdown to SVG/PNG using local `markie` CLI ([MarkieCli](https://github.com/lsj5031/MarkieCli)).
+
+Example diary usage:
+
+```bash
+# Generate today's diary markdown
+scripts/remi-diary.sh --date today
+
+# Generate and send yesterday's diary image to Telegram
+scripts/remi-diary.sh --date yesterday --send
+```
+
+Example Markdown → SVG rendering:
+
+```bash
+scripts/markie-export.sh \
+  --input ~/diary/remi/$(date +%F).md \
+  --output /tmp/remi-diary.svg \
+  --format svg
+```
+
+`remi-diary.sh` prints a safety warning by default because it may send transcript data to external services:
+
+- your configured `pi` model provider (for summary generation)
+- Telegram (when `--send` is enabled)
+
+If you intentionally want to suppress the warning:
+
+```bash
+DIARY_SKIP_EXTERNAL_WARNING=1 scripts/remi-diary.sh --date today
+```
+
+Use `DIARY_*` environment overrides (shown in `scripts/remi-diary.sh --help`) to adapt paths/commands for your environment.
 
 ---
 
