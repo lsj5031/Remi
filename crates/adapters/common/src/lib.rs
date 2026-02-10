@@ -210,34 +210,165 @@ pub fn extract_ts(val: &Value) -> Option<DateTime<Utc>> {
 }
 
 pub fn extract_content_text(content: Option<&Value>) -> String {
-    let mut out = String::new();
     let Some(content) = content else {
-        return out;
+        return String::new();
     };
-    if let Some(s) = content.as_str() {
-        return s.to_string();
-    }
-    if let Some(arr) = content.as_array() {
-        for item in arr {
-            if let Some(s) = item.get("text").and_then(Value::as_str)
-                && !s.trim().is_empty()
-            {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str(s);
-            }
-            if let Some(s) = item.get("thinking").and_then(Value::as_str)
-                && !s.trim().is_empty()
-            {
-                if !out.is_empty() {
-                    out.push('\n');
-                }
-                out.push_str(s);
+    let mut lines = Vec::new();
+    extract_content_lines(content, &mut lines);
+    lines.join("\n")
+}
+
+fn extract_content_lines(value: &Value, lines: &mut Vec<String>) {
+    match value {
+        Value::Null => {}
+        Value::String(s) => push_non_empty_line(lines, s),
+        Value::Array(arr) => {
+            for item in arr {
+                extract_content_lines(item, lines);
             }
         }
+        Value::Object(obj) => {
+            if let Some(kind) = obj.get("type").and_then(Value::as_str) {
+                match kind {
+                    "tool_use" => {
+                        if let Some(text) = format_tool_use(value) {
+                            lines.push(text);
+                        }
+                        return;
+                    }
+                    "tool_result" => {
+                        if let Some(text) = format_tool_result(value) {
+                            lines.push(text);
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(text) = obj.get("text").and_then(Value::as_str) {
+                push_non_empty_line(lines, text);
+            }
+            if let Some(thinking) = obj.get("thinking").and_then(Value::as_str) {
+                push_non_empty_line(lines, thinking);
+            }
+            if let Some(content) = obj.get("content") {
+                extract_content_lines(content, lines);
+            }
+        }
+        Value::Bool(b) => lines.push(b.to_string()),
+        Value::Number(n) => lines.push(n.to_string()),
     }
-    out
+}
+
+fn format_tool_use(value: &Value) -> Option<String> {
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let input = value.get("input").and_then(value_to_text);
+
+    if name.is_none() && input.is_none() {
+        return None;
+    }
+
+    let mut out = String::from("tool_use");
+    if let Some(name) = name {
+        out.push_str(": ");
+        out.push_str(name);
+    }
+    if let Some(input) = input {
+        if name.is_some() {
+            out.push(' ');
+        } else {
+            out.push_str(": ");
+        }
+        out.push_str(&input);
+    }
+    Some(out)
+}
+
+fn format_tool_result(value: &Value) -> Option<String> {
+    let payload = value
+        .get("content")
+        .or_else(|| value.get("result"))
+        .or_else(|| value.get("output"))
+        .or_else(|| value.get("run").and_then(|run| run.get("result")));
+    let text = payload.and_then(value_to_text)?;
+    Some(format!("tool_result: {text}"))
+}
+
+fn value_to_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(s) => {
+            if s.trim().is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        }
+        Value::Bool(b) => Some(b.to_string()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Array(arr) => {
+            let mut lines = Vec::new();
+            for item in arr {
+                if let Some(text) = value_to_text(item) {
+                    for part in text.lines() {
+                        push_non_empty_line(&mut lines, part);
+                    }
+                }
+            }
+            if lines.is_empty() {
+                None
+            } else {
+                Some(lines.join("\n"))
+            }
+        }
+        Value::Object(obj) => {
+            if let Some(text) = obj.get("text").and_then(Value::as_str)
+                && !text.trim().is_empty()
+            {
+                return Some(text.to_string());
+            }
+            if let Some(thinking) = obj.get("thinking").and_then(Value::as_str)
+                && !thinking.trim().is_empty()
+            {
+                return Some(thinking.to_string());
+            }
+            if let Some(content) = obj.get("content")
+                && let Some(text) = value_to_text(content)
+            {
+                return Some(text);
+            }
+            if let Some(result) = obj.get("result")
+                && let Some(text) = value_to_text(result)
+            {
+                return Some(text);
+            }
+            if let Some(output) = obj.get("output")
+                && let Some(text) = value_to_text(output)
+            {
+                return Some(text);
+            }
+            if let Some(run_result) = obj.get("run").and_then(|run| run.get("result"))
+                && let Some(text) = value_to_text(run_result)
+            {
+                return Some(text);
+            }
+            serde_json::to_string(value)
+                .ok()
+                .filter(|s| s != "{}" && s != "[]" && s != "null")
+        }
+    }
+}
+
+fn push_non_empty_line(lines: &mut Vec<String>, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    lines.push(text.to_string());
 }
 
 #[cfg(test)]
@@ -277,6 +408,26 @@ mod tests {
     #[test]
     fn extract_content_text_empty_array() {
         let val = serde_json::json!([]);
+        assert_eq!(extract_content_text(Some(&val)), "");
+    }
+
+    #[test]
+    fn extract_content_text_tool_use_and_result() {
+        let val = serde_json::json!([
+            {"type": "tool_use", "name": "grep", "input": {"pattern": "foo"}},
+            {"type": "tool_result", "content": [{"text": "matched line"}]}
+        ]);
+        assert_eq!(
+            extract_content_text(Some(&val)),
+            "tool_use: grep {\"pattern\":\"foo\"}\ntool_result: matched line"
+        );
+    }
+
+    #[test]
+    fn extract_content_text_skips_empty_tool_result() {
+        let val = serde_json::json!([
+            {"type": "tool_result", "content": "   "}
+        ]);
         assert_eq!(extract_content_text(Some(&val)), "");
     }
 
