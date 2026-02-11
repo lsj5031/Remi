@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 
+#[cfg(feature = "semantic")]
+use chrono::{DateTime, Utc};
+
 use store_sqlite::SqliteStore;
 
 #[cfg(feature = "semantic")]
@@ -21,13 +24,49 @@ pub struct SessionHit {
     pub score: f32,
 }
 
+#[cfg(feature = "semantic")]
+#[derive(Default)]
+pub struct SemanticCache {
+    embeddings: Option<Vec<(String, Vec<f32>)>>,
+    len: usize,
+    updated_at: Option<DateTime<Utc>>,
+}
+
+#[cfg(feature = "semantic")]
+impl SemanticCache {
+    pub fn embeddings(&mut self, store: &SqliteStore) -> anyhow::Result<&[(String, Vec<f32>)]> {
+        let stats = store.embedding_stats()?;
+        let should_refresh = self.embeddings.is_none()
+            || stats.len != self.len
+            || stats.updated_at != self.updated_at;
+        if should_refresh {
+            self.embeddings = Some(store.load_all_embeddings()?);
+            self.len = stats.len;
+            self.updated_at = stats.updated_at;
+        }
+        Ok(self.embeddings.as_deref().unwrap_or(&[]))
+    }
+
+    pub fn clear(&mut self) {
+        self.embeddings = None;
+        self.len = 0;
+        self.updated_at = None;
+    }
+}
+
 pub fn search(
     store: &SqliteStore,
     query: &str,
     limit: usize,
+    raw_fts: bool,
     #[cfg(feature = "semantic")] embedder: Option<&mut Embedder>,
+    #[cfg(feature = "semantic")] cache: Option<&mut SemanticCache>,
 ) -> anyhow::Result<Vec<RankedHit>> {
-    let fts_query = sanitize_fts_query(query);
+    let fts_query = if raw_fts {
+        query.trim().to_string()
+    } else {
+        sanitize_fts_query(query)
+    };
 
     let bm25_rows = if !fts_query.is_empty() {
         store.search_lexical(&fts_query, 200)?
@@ -64,12 +103,18 @@ pub fn search(
     #[cfg(feature = "semantic")]
     let semantic_rows = if let Some(embedder) = embedder {
         let query_vec = embedder.embed(query, true)?;
-        let all = store.load_all_embeddings()?;
-        let mut scored: Vec<(String, f32)> = all
-            .into_iter()
+        let mut owned_embeddings = None;
+        let embeddings = if let Some(cache) = cache {
+            cache.embeddings(store)?
+        } else {
+            owned_embeddings = Some(store.load_all_embeddings()?);
+            owned_embeddings.as_deref().unwrap_or(&[])
+        };
+        let mut scored: Vec<(String, f32)> = embeddings
+            .iter()
             .map(|(id, vec)| {
-                let score = cosine_similarity(&query_vec, &vec);
-                (id, score)
+                let score = cosine_similarity(&query_vec, vec);
+                (id.clone(), score)
             })
             .collect();
         scored.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -149,14 +194,19 @@ pub fn search_sessions(
     store: &SqliteStore,
     query: &str,
     limit: usize,
+    raw_fts: bool,
     #[cfg(feature = "semantic")] embedder: Option<&mut Embedder>,
+    #[cfg(feature = "semantic")] cache: Option<&mut SemanticCache>,
 ) -> anyhow::Result<Vec<SessionHit>> {
     let hits = search(
         store,
         query,
         limit * 5,
+        raw_fts,
         #[cfg(feature = "semantic")]
         embedder,
+        #[cfg(feature = "semantic")]
+        cache,
     )?;
 
     let mut grouped: HashMap<String, (f32, f32, String, String)> = HashMap::new();
@@ -278,9 +328,9 @@ mod tests {
     fn search_finds_match() {
         let store = setup_store();
         #[cfg(feature = "semantic")]
-        let hits = search(&store, "rust", 10, None).unwrap();
+        let hits = search(&store, "rust", 10, false, None, None).unwrap();
         #[cfg(not(feature = "semantic"))]
-        let hits = search(&store, "rust", 10).unwrap();
+        let hits = search(&store, "rust", 10, false).unwrap();
         assert!(!hits.is_empty());
         assert_eq!(hits[0].message_id, "m1");
         assert!(hits[0].score > 0.0);
@@ -290,9 +340,9 @@ mod tests {
     fn search_no_match() {
         let store = setup_store();
         #[cfg(feature = "semantic")]
-        let hits = search(&store, "java", 10, None).unwrap();
+        let hits = search(&store, "java", 10, false, None, None).unwrap();
         #[cfg(not(feature = "semantic"))]
-        let hits = search(&store, "java", 10).unwrap();
+        let hits = search(&store, "java", 10, false).unwrap();
         assert!(hits.is_empty());
     }
 
@@ -300,9 +350,9 @@ mod tests {
     fn search_ranked_by_score() {
         let store = setup_store();
         #[cfg(feature = "semantic")]
-        let hits = search(&store, "rust OR python", 10, None).unwrap();
+        let hits = search(&store, "rust OR python", 10, true, None, None).unwrap();
         #[cfg(not(feature = "semantic"))]
-        let hits = search(&store, "rust OR python", 10).unwrap();
+        let hits = search(&store, "rust OR python", 10, true).unwrap();
         assert!(!hits.is_empty());
         for w in hits.windows(2) {
             assert!(w[0].score >= w[1].score);
@@ -313,9 +363,9 @@ mod tests {
     fn search_sessions_groups_hits() {
         let store = setup_store();
         #[cfg(feature = "semantic")]
-        let sessions = search_sessions(&store, "rust", 10, None).unwrap();
+        let sessions = search_sessions(&store, "rust", 10, false, None, None).unwrap();
         #[cfg(not(feature = "semantic"))]
-        let sessions = search_sessions(&store, "rust", 10).unwrap();
+        let sessions = search_sessions(&store, "rust", 10, false).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "s1");
         assert!(sessions[0].score > 0.0);
@@ -335,9 +385,9 @@ mod tests {
     fn search_substring_fallback() {
         let store = setup_store();
         #[cfg(feature = "semantic")]
-        let hits = search(&store, "progr", 10, None).unwrap();
+        let hits = search(&store, "progr", 10, false, None, None).unwrap();
         #[cfg(not(feature = "semantic"))]
-        let hits = search(&store, "progr", 10).unwrap();
+        let hits = search(&store, "progr", 10, false).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].message_id, "m1");
     }

@@ -1,22 +1,14 @@
-use std::{
-    cell::RefCell,
-    io::{self, IsTerminal, Write},
-    path::PathBuf,
-    time::Instant,
-};
+use std::{cell::RefCell, path::PathBuf, time::Instant};
 
 use anyhow::Context;
-use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use core_model::{Message, Session};
-use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use ingest::SyncPhase;
-use owo_colors::OwoColorize;
-use serde::Serialize;
 use store_sqlite::SqliteStore;
+use tracing::info;
 
 #[cfg(feature = "semantic")]
 mod config;
+mod ui;
 
 #[derive(Parser)]
 #[command(name = "remi")]
@@ -98,6 +90,8 @@ enum SearchCommand {
         id: Option<String>,
         #[arg(long)]
         contains: Option<String>,
+        #[arg(long, default_value_t = false)]
+        raw_fts: bool,
         #[cfg(feature = "semantic")]
         #[arg(long, value_enum, default_value_t = SemanticMode::Auto)]
         semantic: SemanticMode,
@@ -161,46 +155,8 @@ impl SearchFormat {
     }
 }
 
-#[derive(Clone)]
-struct SessionDisplay {
-    session_id: String,
-    title: String,
-    agent: String,
-    updated_at: DateTime<Utc>,
-    message_count: usize,
-    snippet: String,
-    score: f32,
-    match_text: String,
-}
-
-#[derive(Default, Clone)]
-struct FilterSpec {
-    agent: Option<String>,
-    title: Option<String>,
-    id: Option<String>,
-    contains: Option<String>,
-}
-
-#[derive(Serialize)]
-struct JsonSession {
-    id: String,
-    title: String,
-    agent: String,
-    updated_at: DateTime<Utc>,
-    message_count: usize,
-    snippet: String,
-    score: f32,
-}
-
-#[derive(Serialize)]
-struct JsonSearchOutput {
-    query: String,
-    selected_index: usize,
-    selected_session_id: String,
-    sessions: Vec<JsonSession>,
-}
-
 fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
     let cli = Cli::parse();
     #[cfg(feature = "semantic")]
     let config = config::Config::load()?;
@@ -209,7 +165,7 @@ fn main() -> anyhow::Result<()> {
     #[cfg(feature = "semantic")]
     configure_ort(&cli)?;
 
-    eprintln!("opening database...");
+    info!("opening database");
     let mut store = SqliteStore::open_default()?;
     store.init_schema()?;
 
@@ -222,16 +178,14 @@ fn main() -> anyhow::Result<()> {
                 .map(PathBuf::from)
                 .or_else(detect_model_path);
             if let Some(path) = model_path {
-                eprintln!("loading embedding model from {}...", path.display());
+                info!(path = %path.display(), "loading embedding model");
                 Some(embeddings::Embedder::new(
                     path,
                     semantic.pooling.as_deref(),
                     semantic.query_prefix.as_deref(),
                 )?)
             } else {
-                eprintln!(
-                    "warning: semantic search enabled but no model_path configured; skipping"
-                );
+                tracing::warn!("semantic search enabled but no model_path configured; skipping");
                 None
             }
         } else {
@@ -241,9 +195,12 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    #[cfg(feature = "semantic")]
+    let mut semantic_cache = search::SemanticCache::default();
+
     match cli.command {
         Commands::Init => {
-            eprintln!("initialized in {:.0?}", t.elapsed());
+            info!(elapsed = ?t.elapsed(), "initialized");
         }
         Commands::Sync(args) => {
             let synced = match args.agent {
@@ -296,19 +253,19 @@ fn main() -> anyhow::Result<()> {
                     total
                 }
             };
-            eprintln!("synced {synced} records in {:.1?}", t.elapsed());
+            info!(records = synced, elapsed = ?t.elapsed(), "synced");
         }
         Commands::Sessions { command } => match command {
             SessionsCommand::List => {
                 let sessions = store.list_sessions()?;
-                eprintln!("{} sessions", sessions.len());
+                info!(sessions = sessions.len(), "sessions listed");
                 for s in &sessions {
                     println!("{} {} {}", s.id, s.agent.as_str(), s.title);
                 }
             }
             SessionsCommand::Show { session_id } => {
                 let msgs = store.get_session_messages(&session_id)?;
-                eprintln!("{} messages", msgs.len());
+                info!(messages = msgs.len(), "session messages listed");
                 for m in &msgs {
                     println!("{} [{}] {}", m.ts.to_rfc3339(), m.role, m.content);
                 }
@@ -325,20 +282,19 @@ fn main() -> anyhow::Result<()> {
                 title,
                 id,
                 contains,
+                raw_fts,
                 #[cfg(feature = "semantic")]
                 semantic,
                 output_dir,
             } => {
-                eprintln!("searching for \"{}\"...", query);
+                info!(query = %query, "searching");
                 #[cfg(feature = "semantic")]
                 let search_embedder = match semantic {
                     SemanticMode::Off => None,
                     SemanticMode::Auto => embedder.as_mut(),
                     SemanticMode::On => {
                         if embedder.is_none() {
-                            eprintln!(
-                                "warning: semantic search requested but no embedder configured"
-                            );
+                            tracing::warn!("semantic search requested but no embedder configured");
                         }
                         embedder.as_mut()
                     }
@@ -347,26 +303,29 @@ fn main() -> anyhow::Result<()> {
                     &store,
                     &query,
                     20,
+                    raw_fts,
                     #[cfg(feature = "semantic")]
                     search_embedder,
+                    #[cfg(feature = "semantic")]
+                    Some(&mut semantic_cache),
                 )?;
                 if hits.is_empty() {
-                    eprintln!("no results in {:.1?}", t.elapsed());
+                    info!(elapsed = ?t.elapsed(), "no results");
                     return Ok(());
                 }
-                let mut sessions = build_session_displays(&store, &hits)?;
+                let mut sessions = ui::build_session_displays(&store, &hits)?;
                 if sessions.is_empty() {
-                    eprintln!("no sessions to display in {:.1?}", t.elapsed());
+                    info!(elapsed = ?t.elapsed(), "no sessions to display");
                     return Ok(());
                 }
 
-                let filters = FilterSpec {
+                let filters = ui::FilterSpec {
                     agent,
                     title,
                     id,
                     contains,
                 };
-                sessions = apply_filters(&sessions, &filters);
+                sessions = ui::apply_filters(&sessions, &filters);
                 if sessions.is_empty() {
                     return Err(anyhow::anyhow!("no sessions matched filters"));
                 }
@@ -387,25 +346,25 @@ fn main() -> anyhow::Result<()> {
                     let selected = sessions[selected_index].clone();
                     (selected, selected_index, sessions)
                 } else {
-                    eprintln!("{} sessions matched in {:.1?}", sessions.len(), t.elapsed());
-                    print_session_list(&sessions, &[]);
-                    let filter = prompt_line(
+                    info!(sessions = sessions.len(), elapsed = ?t.elapsed(), "sessions matched");
+                    ui::print_session_list(&sessions, &[]);
+                    let filter = ui::prompt_line(
                         "filter (fuzzy; fields: agent:, title:, id:, contains:; example: \"agent:claude auth login\") — enter to keep: ",
                     )?;
                     let (mut filtered, terms) = if filter.trim().is_empty() {
                         (sessions.clone(), Vec::new())
                     } else {
-                        fuzzy_filter_sessions(&sessions, &filter)
+                        ui::fuzzy_filter_sessions(&sessions, &filter)
                     };
                     if filtered.is_empty() {
-                        eprintln!("no sessions matched filter; keeping original list");
+                        info!("no sessions matched filter; keeping original list");
                         filtered = sessions.clone();
                     } else {
-                        eprintln!("{} sessions matched filter", filtered.len());
+                        info!(sessions = filtered.len(), "sessions matched filter");
                     }
-                    print_session_list(&filtered, &terms);
-                    let choice = prompt_line("select index (default 0): ")?;
-                    let selected_index = parse_index(&choice, filtered.len())?;
+                    ui::print_session_list(&filtered, &terms);
+                    let choice = ui::prompt_line("select index (default 0): ")?;
+                    let selected_index = ui::parse_index(&choice, filtered.len())?;
                     let selected = filtered[selected_index].clone();
                     (selected, selected_index, filtered)
                 };
@@ -413,7 +372,7 @@ fn main() -> anyhow::Result<()> {
                 if matches!(format, SearchFormat::Json) {
                     let sessions = sessions
                         .into_iter()
-                        .map(|item| JsonSession {
+                        .map(|item| ui::JsonSession {
                             id: item.session_id,
                             title: item.title,
                             agent: item.agent,
@@ -423,7 +382,7 @@ fn main() -> anyhow::Result<()> {
                             score: item.score,
                         })
                         .collect();
-                    let output = JsonSearchOutput {
+                    let output = ui::JsonSearchOutput {
                         query: query.clone(),
                         selected_index,
                         selected_session_id: selected.session_id.clone(),
@@ -438,11 +397,11 @@ fn main() -> anyhow::Result<()> {
                     .with_context(|| "selected session missing")?;
                 let messages = store.get_session_messages(&selected.session_id)?;
                 let rendered = match format {
-                    SearchFormat::Html => render_session_html(&session, &messages),
-                    SearchFormat::Markdown => render_session_markdown(&session, &messages),
+                    SearchFormat::Html => ui::render_session_html(&session, &messages),
+                    SearchFormat::Markdown => ui::render_session_markdown(&session, &messages),
                     SearchFormat::Json => unreachable!("handled earlier"),
                 };
-                let out_dir = resolve_output_dir(output_dir)?;
+                let out_dir = ui::resolve_output_dir(output_dir)?;
                 let file_path =
                     out_dir.join(format!("session_{}.{}", session.id, format.extension()));
                 std::fs::write(&file_path, rendered)?;
@@ -456,14 +415,11 @@ fn main() -> anyhow::Result<()> {
             } => {
                 let d = humantime::parse_duration(&older_than)
                     .with_context(|| "invalid --older-than")?;
-                eprintln!(
-                    "planning archive: older than {}, keep latest {}...",
-                    older_than, keep_latest
-                );
+                info!(older_than = %older_than, keep_latest, "planning archive");
                 let run_id =
                     archive::archive_plan(&store, chrono::Duration::from_std(d)?, keep_latest)?;
                 let items = store.archive_items_for_run(&run_id)?;
-                eprintln!("{} sessions selected in {:.1?}", items.len(), t.elapsed());
+                info!(sessions = items.len(), elapsed = ?t.elapsed(), "sessions selected");
                 println!("plan {run_id}");
             }
             ArchiveCommand::Run {
@@ -474,21 +430,21 @@ fn main() -> anyhow::Result<()> {
             } => {
                 let should_execute = execute && !dry_run;
                 if should_execute {
-                    eprintln!("executing archive run {}...", plan);
+                    info!(run_id = %plan, "executing archive run");
                     if delete_source {
-                        eprintln!("  --delete-source: will remove archived sessions from DB");
+                        info!("--delete-source: will remove archived sessions from DB");
                     }
                 } else {
-                    eprintln!("dry-run for archive run {}...", plan);
+                    info!(run_id = %plan, "dry-run for archive run");
                 }
                 let msg = archive::archive_run(&store, &plan, should_execute, delete_source)?;
-                eprintln!("done in {:.1?}", t.elapsed());
+                info!(elapsed = ?t.elapsed(), "archive run done");
                 println!("{msg}");
             }
             ArchiveCommand::Restore { bundle } => {
-                eprintln!("restoring from {}...", bundle);
+                info!(bundle = %bundle, "restoring archive");
                 let msg = archive::archive_restore(&mut store, &bundle)?;
-                eprintln!("done in {:.1?}", t.elapsed());
+                info!(elapsed = ?t.elapsed(), "restore done");
                 println!("{msg}");
             }
         },
@@ -496,7 +452,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Embed { rebuild } => {
             if let Some(embedder) = embedder.as_mut() {
                 if rebuild {
-                    eprintln!("rebuilding embeddings...");
+                    info!("rebuilding embeddings");
                     let sessions = store.list_sessions()?;
                     let mut count = 0;
                     for s in &sessions {
@@ -511,22 +467,22 @@ fn main() -> anyhow::Result<()> {
                             }
                         }
                         if count > 0 && count % 100 == 0 {
-                            eprintln!("processed {} messages...", count);
+                            info!(processed = count, "processed messages");
                         }
                     }
-                    eprintln!("computed {} embeddings in {:.1?}", count, t.elapsed());
+                    info!(count, elapsed = ?t.elapsed(), "computed embeddings");
                 } else {
-                    eprintln!("use --rebuild to rebuild all embeddings");
+                    info!("use --rebuild to rebuild all embeddings");
                 }
             } else {
-                eprintln!("semantic search not enabled or configured");
+                info!("semantic search not enabled or configured");
             }
         }
         Commands::Doctor => {
-            eprintln!("running integrity check...");
+            info!("running integrity check");
             let check = store.integrity_check()?;
             let sessions = store.list_sessions()?;
-            eprintln!("done in {:.1?}", t.elapsed());
+            info!(elapsed = ?t.elapsed(), "integrity check done");
             println!("integrity_check={check}");
             println!("sessions={}", sessions.len());
         }
@@ -550,10 +506,10 @@ fn configure_ort(cli: &Cli) -> anyhow::Result<()> {
             return Ok(());
         }
         if let Some(found) = find_ort_dylib()? {
-            eprintln!("using ORT dylib at {}", found.display());
+            info!(path = %found.display(), "using ORT dylib");
             std::env::set_var("ORT_DYLIB_PATH", found);
         } else {
-            eprintln!("warning: failed to auto-detect libonnxruntime.so");
+            tracing::warn!("failed to auto-detect libonnxruntime.so");
         }
     }
 
@@ -627,7 +583,7 @@ fn sync_with_timing(
     #[cfg(feature = "semantic")] embedder: Option<&mut embeddings::Embedder>,
 ) -> anyhow::Result<usize> {
     let started = Instant::now();
-    eprintln!("[{name}] sync start...");
+    info!(name, "sync start");
     let count = sync_one(
         name,
         adapter,
@@ -635,10 +591,7 @@ fn sync_with_timing(
         #[cfg(feature = "semantic")]
         embedder,
     )?;
-    eprintln!(
-        "[{name}] sync done in {:.1?} ({count} records)",
-        started.elapsed()
-    );
+    info!(name, count, elapsed = ?started.elapsed(), "sync done");
     Ok(count)
 }
 
@@ -660,375 +613,63 @@ fn sync_one(
                 let now = Instant::now();
                 let since_last = now.duration_since(*last.borrow());
                 *last.borrow_mut() = now;
-                eprintln!(
-                    "[{name}] discovering source files... ({:.1?} since start, +{:.1?})",
-                    started.elapsed(),
-                    since_last
+                info!(
+                    name,
+                    elapsed = ?started.elapsed(),
+                    delta = ?since_last,
+                    "discovering source files"
                 );
             }
             SyncPhase::Scanning { file_count } => {
                 let now = Instant::now();
                 let since_last = now.duration_since(*last.borrow());
                 *last.borrow_mut() = now;
-                eprintln!(
-                    "[{name}] scanning {file_count} files... ({:.1?} since start, +{:.1?})",
-                    started.elapsed(),
-                    since_last
+                info!(
+                    name,
+                    file_count,
+                    elapsed = ?started.elapsed(),
+                    delta = ?since_last,
+                    "scanning files"
                 );
             }
             SyncPhase::Normalizing { record_count } => {
                 let now = Instant::now();
                 let since_last = now.duration_since(*last.borrow());
                 *last.borrow_mut() = now;
-                eprintln!(
-                    "[{name}] normalizing {record_count} records... ({:.1?} since start, +{:.1?})",
-                    started.elapsed(),
-                    since_last
+                info!(
+                    name,
+                    record_count,
+                    elapsed = ?started.elapsed(),
+                    delta = ?since_last,
+                    "normalizing records"
                 );
             }
             SyncPhase::Saving { message_count } => {
                 let now = Instant::now();
                 let since_last = now.duration_since(*last.borrow());
                 *last.borrow_mut() = now;
-                eprintln!(
-                    "[{name}] saving {message_count} messages... ({:.1?} since start, +{:.1?})",
-                    started.elapsed(),
-                    since_last
+                info!(
+                    name,
+                    message_count,
+                    elapsed = ?started.elapsed(),
+                    delta = ?since_last,
+                    "saving messages"
                 );
             }
             SyncPhase::Done { total_records } => {
                 let now = Instant::now();
                 let since_last = now.duration_since(*last.borrow());
                 *last.borrow_mut() = now;
-                eprintln!(
-                    "[{name}] done: {total_records} records ({:.1?} since start, +{:.1?})",
-                    started.elapsed(),
-                    since_last
+                info!(
+                    name,
+                    total_records,
+                    elapsed = ?started.elapsed(),
+                    delta = ?since_last,
+                    "sync done"
                 );
             }
         },
     )
-}
-
-fn build_session_displays(
-    store: &SqliteStore,
-    hits: &[search::SessionHit],
-) -> anyhow::Result<Vec<SessionDisplay>> {
-    let mut out = Vec::with_capacity(hits.len());
-    for hit in hits {
-        let Some(session) = store.get_session(&hit.session_id)? else {
-            continue;
-        };
-        let messages = store.get_session_messages(&hit.session_id)?;
-        let message_count = messages.len();
-        let title = session_title(&session, &messages);
-        let snippet = truncate_text(&hit.top_content, 140);
-        let match_text = format!(
-            "{} {} {} {}",
-            title,
-            session.id,
-            snippet,
-            session.agent.as_str()
-        );
-        out.push(SessionDisplay {
-            session_id: session.id.clone(),
-            title,
-            agent: session.agent.as_str().to_string(),
-            updated_at: session.updated_at,
-            message_count,
-            snippet,
-            score: hit.score,
-            match_text,
-        });
-    }
-    Ok(out)
-}
-
-fn session_title(session: &Session, messages: &[Message]) -> String {
-    let title = session.title.trim();
-    if !title.is_empty() {
-        return title.to_string();
-    }
-    messages
-        .iter()
-        .find(|m| m.role == "user")
-        .map(|m| truncate_text(&m.content, 60))
-        .unwrap_or_else(|| "Untitled session".to_string())
-}
-
-fn prompt_line(prompt: &str) -> anyhow::Result<String> {
-    if color_enabled() {
-        print!("{}", prompt.cyan());
-    } else {
-        print!("{prompt}");
-    }
-    io::stdout().flush()?;
-    let mut buf = String::new();
-    io::stdin().read_line(&mut buf)?;
-    Ok(buf.trim_end().to_string())
-}
-
-fn parse_index(input: &str, len: usize) -> anyhow::Result<usize> {
-    if input.trim().is_empty() {
-        return Ok(0);
-    }
-    let idx: usize = input.trim().parse().with_context(|| "invalid index")?;
-    if idx >= len {
-        return Err(anyhow::anyhow!("index out of range"));
-    }
-    Ok(idx)
-}
-
-fn print_session_list(items: &[SessionDisplay], terms: &[String]) {
-    let use_color = color_enabled();
-    for (i, item) in items.iter().enumerate() {
-        let title = highlight_terms(&item.title, terms, use_color);
-        let agent = highlight_terms(&item.agent, terms, use_color);
-        let snippet = highlight_terms(&item.snippet, terms, use_color);
-        let date = item.updated_at.to_rfc3339();
-        let count = format!("{} msgs", item.message_count);
-        let separator = if use_color {
-            " | ".dimmed().to_string()
-        } else {
-            " | ".to_string()
-        };
-        let title = if use_color {
-            title.bold().to_string()
-        } else {
-            title
-        };
-        let agent = if use_color {
-            agent.cyan().to_string()
-        } else {
-            agent
-        };
-        let count = if use_color {
-            count.magenta().to_string()
-        } else {
-            count
-        };
-        let date = if use_color {
-            date.dimmed().to_string()
-        } else {
-            date
-        };
-        let snippet = if use_color {
-            snippet.dimmed().to_string()
-        } else {
-            snippet
-        };
-        println!(
-            "[{i}] {title}{separator}{agent}{separator}{count}{separator}{date}{separator}{snippet}"
-        );
-    }
-}
-
-fn fuzzy_filter_sessions(
-    items: &[SessionDisplay],
-    query: &str,
-) -> (Vec<SessionDisplay>, Vec<String>) {
-    let (filters, terms) = parse_fuzzy_query(query);
-    let filtered = apply_filters(items, &filters);
-    if terms.is_empty() {
-        return (filtered, terms);
-    }
-    let matcher = SkimMatcherV2::default();
-    let mut scored: Vec<(i64, SessionDisplay)> = filtered
-        .iter()
-        .filter_map(|item| {
-            let mut total = 0i64;
-            for term in &terms {
-                let score = matcher.fuzzy_match(&item.match_text, term)?;
-                total += score;
-            }
-            Some((total, item.clone()))
-        })
-        .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
-    (scored.into_iter().map(|(_, item)| item).collect(), terms)
-}
-
-fn parse_fuzzy_query(input: &str) -> (FilterSpec, Vec<String>) {
-    let mut filters = FilterSpec::default();
-    let mut terms = Vec::new();
-    for raw in input.split_whitespace() {
-        let Some((key, value)) = raw.split_once(':') else {
-            terms.push(raw.to_string());
-            continue;
-        };
-        let value = value.trim();
-        if value.is_empty() {
-            continue;
-        }
-        match key {
-            "agent" => filters.agent = Some(value.to_string()),
-            "title" => filters.title = Some(value.to_string()),
-            "id" => filters.id = Some(value.to_string()),
-            "contains" => filters.contains = Some(value.to_string()),
-            _ => terms.push(raw.to_string()),
-        }
-    }
-    (filters, terms)
-}
-
-fn apply_filters(items: &[SessionDisplay], filters: &FilterSpec) -> Vec<SessionDisplay> {
-    let agent = filters.agent.as_ref().map(|s| s.to_lowercase());
-    let title = filters.title.as_ref().map(|s| s.to_lowercase());
-    let id = filters.id.as_ref().map(|s| s.to_lowercase());
-    let contains = filters.contains.as_ref().map(|s| s.to_lowercase());
-    items
-        .iter()
-        .filter(|item| {
-            if let Some(agent) = agent.as_ref()
-                && !item.agent.to_lowercase().contains(agent)
-            {
-                return false;
-            }
-            if let Some(title) = title.as_ref()
-                && !item.title.to_lowercase().contains(title)
-            {
-                return false;
-            }
-            if let Some(id) = id.as_ref()
-                && !item.session_id.to_lowercase().contains(id)
-            {
-                return false;
-            }
-            if let Some(contains) = contains.as_ref()
-                && !item.match_text.to_lowercase().contains(contains)
-            {
-                return false;
-            }
-            true
-        })
-        .cloned()
-        .collect()
-}
-
-fn color_enabled() -> bool {
-    io::stdout().is_terminal()
-        && io::stderr().is_terminal()
-        && std::env::var_os("NO_COLOR").is_none()
-}
-
-fn highlight_terms(text: &str, terms: &[String], use_color: bool) -> String {
-    if !use_color || terms.is_empty() {
-        return text.to_string();
-    }
-    let mut ranges = Vec::new();
-    for term in terms {
-        if term.is_empty() {
-            continue;
-        }
-        for (start, _) in text.match_indices(term) {
-            ranges.push((start, start + term.len()));
-        }
-    }
-    if ranges.is_empty() {
-        return text.to_string();
-    }
-    ranges.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut merged: Vec<(usize, usize)> = Vec::new();
-    for (start, end) in ranges {
-        if let Some(last) = merged.last_mut()
-            && start <= last.1
-        {
-            last.1 = last.1.max(end);
-            continue;
-        }
-        merged.push((start, end));
-    }
-    let mut out = String::new();
-    let mut cursor = 0;
-    for (start, end) in merged {
-        if cursor < start {
-            out.push_str(&text[cursor..start]);
-        }
-        let slice = &text[start..end];
-        out.push_str(&slice.yellow().bold().to_string());
-        cursor = end;
-    }
-    if cursor < text.len() {
-        out.push_str(&text[cursor..]);
-    }
-    out
-}
-
-fn truncate_text(input: &str, max: usize) -> String {
-    let mut out = String::new();
-    for (i, ch) in input.chars().enumerate() {
-        if i >= max {
-            out.push_str("...");
-            return out;
-        }
-        out.push(ch);
-    }
-    out
-}
-
-fn render_session_html(session: &Session, messages: &[Message]) -> String {
-    let title = escape_html(&session.title);
-    let mut body = String::new();
-    body.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
-    body.push_str("<style>body{font-family:system-ui,Arial,sans-serif;max-width:900px;margin:2rem auto;line-height:1.5}h1{font-size:1.6rem} .meta{color:#555;font-size:.9rem;margin-bottom:1rem} .msg{padding:.6rem .8rem;border:1px solid #e3e3e3;border-radius:8px;margin:.6rem 0} .role{font-weight:600;margin-bottom:.4rem} pre{white-space:pre-wrap}</style></head><body>");
-    body.push_str(&format!("<h1>{}</h1>", title));
-    body.push_str(&format!(
-        "<div class=\"meta\">Session {} · {} · {} messages</div>",
-        escape_html(&session.id),
-        escape_html(session.agent.as_str()),
-        messages.len()
-    ));
-    for msg in messages {
-        let role = escape_html(&msg.role);
-        let ts = escape_html(&msg.ts.to_rfc3339());
-        let content = escape_html(&msg.content);
-        body.push_str("<div class=\"msg\">");
-        body.push_str(&format!("<div class=\"role\">{} · {}</div>", role, ts));
-        body.push_str(&format!("<pre>{}</pre>", content));
-        body.push_str("</div>");
-    }
-    body.push_str("</body></html>");
-    body
-}
-
-fn render_session_markdown(session: &Session, messages: &[Message]) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("# {}\n\n", session.title));
-    out.push_str(&format!(
-        "Session `{}` · `{}` · {} messages\n\n",
-        session.id,
-        session.agent.as_str(),
-        messages.len()
-    ));
-    for msg in messages {
-        out.push_str(&format!("## {} ({})\n\n", msg.role, msg.ts.to_rfc3339()));
-        out.push_str(&msg.content);
-        out.push_str("\n\n");
-    }
-    out
-}
-
-fn escape_html(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
-fn resolve_output_dir(dir: Option<PathBuf>) -> anyhow::Result<PathBuf> {
-    let base = if let Some(dir) = dir {
-        dir
-    } else {
-        dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("remi")
-            .join("exports")
-    };
-    std::fs::create_dir_all(&base)
-        .with_context(|| format!("creating output dir {}", base.display()))?;
-    Ok(base)
 }
 
 #[cfg(feature = "semantic")]
@@ -1048,7 +689,7 @@ fn detect_model_path() -> Option<PathBuf> {
         let model = path.join("model.onnx");
         let tokenizer = path.join("tokenizer.json");
         if model.exists() && tokenizer.exists() {
-            eprintln!("auto-detected model at {}", path.display());
+            info!(path = %path.display(), "auto-detected model");
             return Some(path);
         }
     }

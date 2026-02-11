@@ -17,6 +17,8 @@ pub struct ArchiveBundle {
     pub run_id: String,
     pub sessions: Vec<core_model::Session>,
     pub messages: Vec<core_model::Message>,
+    pub events: Vec<core_model::Event>,
+    pub artifacts: Vec<core_model::Artifact>,
     pub provenance: Vec<core_model::Provenance>,
 }
 
@@ -55,6 +57,8 @@ pub fn archive_run(
         run_id: run_id.to_string(),
         sessions: Vec::new(),
         messages: Vec::new(),
+        events: Vec::new(),
+        artifacts: Vec::new(),
         provenance: Vec::new(),
     };
     for item in &items {
@@ -64,6 +68,12 @@ pub fn archive_run(
         bundle
             .messages
             .extend(store.get_session_messages(&item.session_id)?);
+        bundle
+            .events
+            .extend(store.get_session_events(&item.session_id)?);
+        bundle
+            .artifacts
+            .extend(store.get_session_artifacts(&item.session_id)?);
         bundle
             .provenance
             .extend(store.get_provenance_for_session(&item.session_id)?);
@@ -108,8 +118,8 @@ pub fn archive_restore(store: &mut SqliteStore, bundle_path: &str) -> anyhow::Re
     let batch = core_model::NormalizedBatch {
         sessions: bundle.sessions,
         messages: bundle.messages,
-        events: Vec::new(),
-        artifacts: Vec::new(),
+        events: bundle.events,
+        artifacts: bundle.artifacts,
         provenance: bundle.provenance,
     };
     let count = batch.sessions.len();

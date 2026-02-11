@@ -8,10 +8,10 @@ license.workspace = true
 anyhow.workspace = true
 store-sqlite = { path = "../store-sqlite" }
 embeddings = { path = "../embeddings", optional = true }
+chrono.workspace = true
 
 [features]
 semantic = ["dep:embeddings", "store-sqlite/semantic"]
 
 [dev-dependencies]
-chrono.workspace = true
 core-model = { path = "../core-model" }

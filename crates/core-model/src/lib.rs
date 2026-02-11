@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::fmt;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum AgentKind {
@@ -19,6 +20,27 @@ impl AgentKind {
             AgentKind::OpenCode => "opencode",
             AgentKind::Claude => "claude",
             AgentKind::Amp => "amp",
+        }
+    }
+}
+
+impl fmt::Display for AgentKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for AgentKind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pi" => Ok(AgentKind::Pi),
+            "droid" => Ok(AgentKind::Droid),
+            "opencode" => Ok(AgentKind::OpenCode),
+            "claude" => Ok(AgentKind::Claude),
+            "amp" => Ok(AgentKind::Amp),
+            _ => anyhow::bail!("unknown agent kind: {s}"),
         }
     }
 }

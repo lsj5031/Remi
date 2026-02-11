@@ -1,9 +1,10 @@
-use std::{fs, path::Path, time::SystemTime};
+use std::{collections::HashMap, fs, io::BufRead, path::Path, time::SystemTime};
 
 use chrono::{DateTime, TimeZone, Utc};
 use core_model::{AgentKind, NativeRecord, NormalizedBatch, deterministic_id};
 use rayon::prelude::*;
 use serde_json::Value;
+use tracing::warn;
 
 pub fn collect_files_with_ext(root: &Path, ext: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -52,36 +53,49 @@ pub fn load_jsonl(
                 .and_then(|s| s.to_str())
                 .unwrap_or(path)
                 .to_string();
-            let Ok(content) = fs::read_to_string(path) else {
-                return Vec::new();
+            let file = match fs::File::open(path) {
+                Ok(file) => file,
+                Err(_) => return Vec::new(),
             };
-            content
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .filter_map(|line| {
-                    let mut val: Value = serde_json::from_str(line).ok()?;
-                    let ts = extract_ts(&val).or(file_mtime).unwrap_or_else(Utc::now);
-                    if let Some(obj) = val.as_object_mut() {
-                        obj.insert("__source_path".to_string(), Value::String(path.clone()));
-                        obj.insert("__session_seed".to_string(), Value::String(stem.clone()));
+            let reader = std::io::BufReader::new(file);
+            let mut records = Vec::new();
+            let mut skipped_lines = 0usize;
+            for line in reader.lines().map_while(Result::ok) {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let mut val: Value = match serde_json::from_str(&line) {
+                    Ok(val) => val,
+                    Err(_) => {
+                        skipped_lines += 1;
+                        continue;
                     }
-                    let source_id = val
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .map(ToOwned::to_owned)
-                        .unwrap_or_else(|| deterministic_id(&[path, line]));
-                    if let Some(ref cur) = parsed_cursor
-                        && should_skip(ts, &source_id, cur)
-                    {
-                        return None;
-                    }
-                    Some(NativeRecord {
-                        source_id,
-                        updated_at: ts,
-                        payload: val,
-                    })
-                })
-                .collect::<Vec<_>>()
+                };
+                let ts = extract_ts(&val).or(file_mtime).unwrap_or_else(Utc::now);
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert("__source_path".to_string(), Value::String(path.clone()));
+                    obj.insert("__session_seed".to_string(), Value::String(stem.clone()));
+                }
+                let source_id = val
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| deterministic_id(&[path, &line]));
+                if let Some(ref cur) = parsed_cursor
+                    && should_skip(ts, &source_id, cur)
+                {
+                    continue;
+                }
+                records.push(NativeRecord {
+                    source_id,
+                    updated_at: ts,
+                    payload: val,
+                });
+            }
+            if skipped_lines > 0 {
+                warn!(path = %path, skipped_lines, "skipped malformed jsonl lines");
+            }
+            records
         })
         .collect();
     out.sort_by(|a, b| {
@@ -94,6 +108,7 @@ pub fn load_jsonl(
 
 pub fn normalize_jsonl_records(kind: AgentKind, records: &[NativeRecord]) -> NormalizedBatch {
     let mut batch = NormalizedBatch::default();
+    let mut sessions: HashMap<String, core_model::Session> = HashMap::new();
     for rec in records {
         if rec.payload.get("type").and_then(Value::as_str) != Some("message") {
             continue;
@@ -126,14 +141,27 @@ pub fn normalize_jsonl_records(kind: AgentKind, records: &[NativeRecord]) -> Nor
         let session_id = deterministic_id(&[kind.as_str(), "session", session_seed]);
         let message_id = deterministic_id(&[kind.as_str(), "message", &rec.source_id]);
         let now = rec.updated_at;
-        batch.sessions.push(core_model::Session {
-            id: session_id.clone(),
-            agent: kind,
-            source_ref: session_seed.to_string(),
-            title: title.to_string(),
-            created_at: now,
-            updated_at: now,
-        });
+        let session = sessions
+            .entry(session_id.clone())
+            .or_insert_with(|| core_model::Session {
+                id: session_id.clone(),
+                agent: kind,
+                source_ref: session_seed.to_string(),
+                title: title.to_string(),
+                created_at: now,
+                updated_at: now,
+            });
+        if now < session.created_at {
+            session.created_at = now;
+        }
+        if now > session.updated_at {
+            session.updated_at = now;
+        }
+        if (session.title.is_empty() || session.title == session.source_ref)
+            && title != session_seed
+        {
+            session.title = title.to_string();
+        }
         batch.messages.push(core_model::Message {
             id: message_id.clone(),
             session_id: session_id.clone(),
@@ -155,6 +183,13 @@ pub fn normalize_jsonl_records(kind: AgentKind, records: &[NativeRecord]) -> Nor
             source_id: rec.source_id.clone(),
         });
     }
+    let mut ordered_sessions: Vec<_> = sessions.into_values().collect();
+    ordered_sessions.sort_by(|a, b| {
+        a.updated_at
+            .cmp(&b.updated_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    batch.sessions.extend(ordered_sessions);
     batch
 }
 

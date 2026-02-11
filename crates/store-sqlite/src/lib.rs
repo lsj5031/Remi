@@ -6,8 +6,9 @@ use core_model::{
     ArchiveItem, ArchiveRun, Checkpoint, Message, NormalizedBatch, Provenance, Session,
     deterministic_id,
 };
-use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
-use std::{collections::BTreeSet, time::Instant};
+use rusqlite::{Connection, OptionalExtension, params};
+use std::time::Instant;
+use tracing::info;
 
 pub struct SqliteStore {
     conn: Connection,
@@ -20,6 +21,13 @@ pub struct SearchRow {
     pub content: String,
     pub ts: DateTime<Utc>,
     pub score: f64,
+}
+
+#[cfg(feature = "semantic")]
+#[derive(Debug, Clone, Default)]
+pub struct EmbeddingStats {
+    pub len: usize,
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 impl SqliteStore {
@@ -39,92 +47,122 @@ impl SqliteStore {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
         )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(Self { conn })
     }
 
     pub fn init_schema(&self) -> anyhow::Result<()> {
-        self.conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS agents (
-              id TEXT PRIMARY KEY,
-              name TEXT NOT NULL UNIQUE
-            );
-            CREATE TABLE IF NOT EXISTS sessions (
-              id TEXT PRIMARY KEY,
-              agent TEXT NOT NULL,
-              source_ref TEXT NOT NULL,
-              title TEXT NOT NULL,
-              created_at TEXT NOT NULL,
-              updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS messages (
-              id TEXT PRIMARY KEY,
-              session_id TEXT NOT NULL,
-              role TEXT NOT NULL,
-              content TEXT NOT NULL,
-              ts TEXT NOT NULL,
-              FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS events (
-              id TEXT PRIMARY KEY,
-              session_id TEXT NOT NULL,
-              kind TEXT NOT NULL,
-              payload TEXT NOT NULL,
-              ts TEXT NOT NULL,
-              FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS artifacts (
-              id TEXT PRIMARY KEY,
-              session_id TEXT NOT NULL,
-              path TEXT NOT NULL,
-              checksum TEXT NOT NULL,
-              metadata TEXT NOT NULL,
-              FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS provenance (
-              id TEXT PRIMARY KEY,
-              entity_type TEXT NOT NULL,
-              entity_id TEXT NOT NULL,
-              agent TEXT NOT NULL,
-              source_path TEXT NOT NULL,
-              source_id TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS checkpoints (
-              agent TEXT PRIMARY KEY,
-              cursor TEXT NOT NULL,
-              updated_at TEXT NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS archive_runs (
-              id TEXT PRIMARY KEY,
-              created_at TEXT NOT NULL,
-              older_than_secs INTEGER NOT NULL,
-              keep_latest INTEGER NOT NULL,
-              dry_run INTEGER NOT NULL,
-              executed INTEGER NOT NULL
-            );
-            CREATE TABLE IF NOT EXISTS archive_items (
-              id TEXT PRIMARY KEY,
-              run_id TEXT NOT NULL,
-              session_id TEXT NOT NULL,
-              planned_delete INTEGER NOT NULL,
-              FOREIGN KEY(run_id) REFERENCES archive_runs(id) ON DELETE CASCADE,
-              FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
-            );
-            CREATE TABLE IF NOT EXISTS message_embeddings (
-              message_id TEXT PRIMARY KEY,
-              dim INTEGER NOT NULL,
-              vec BLOB NOT NULL,
-              FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
-            );
-            CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
-              message_id UNINDEXED,
-              session_id UNINDEXED,
-              content,
-              ts UNINDEXED,
-              tokenize = 'unicode61 tokenchars ''_./:-'''
-            );
-            "#,
-        )?;
+        let version: i64 = self
+            .conn
+            .query_row("PRAGMA user_version;", [], |r| r.get(0))?;
+        if version < 1 {
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS agents (
+                  id TEXT PRIMARY KEY,
+                  name TEXT NOT NULL UNIQUE
+                );
+                CREATE TABLE IF NOT EXISTS sessions (
+                  id TEXT PRIMARY KEY,
+                  agent TEXT NOT NULL,
+                  source_ref TEXT NOT NULL,
+                  title TEXT NOT NULL,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS messages (
+                  id TEXT PRIMARY KEY,
+                  session_id TEXT NOT NULL,
+                  role TEXT NOT NULL,
+                  content TEXT NOT NULL,
+                  ts TEXT NOT NULL,
+                  FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS events (
+                  id TEXT PRIMARY KEY,
+                  session_id TEXT NOT NULL,
+                  kind TEXT NOT NULL,
+                  payload TEXT NOT NULL,
+                  ts TEXT NOT NULL,
+                  FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS artifacts (
+                  id TEXT PRIMARY KEY,
+                  session_id TEXT NOT NULL,
+                  path TEXT NOT NULL,
+                  checksum TEXT NOT NULL,
+                  metadata TEXT NOT NULL,
+                  FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS provenance (
+                  id TEXT PRIMARY KEY,
+                  entity_type TEXT NOT NULL,
+                  entity_id TEXT NOT NULL,
+                  agent TEXT NOT NULL,
+                  source_path TEXT NOT NULL,
+                  source_id TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS checkpoints (
+                  agent TEXT PRIMARY KEY,
+                  cursor TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS archive_runs (
+                  id TEXT PRIMARY KEY,
+                  created_at TEXT NOT NULL,
+                  older_than_secs INTEGER NOT NULL,
+                  keep_latest INTEGER NOT NULL,
+                  dry_run INTEGER NOT NULL,
+                  executed INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS archive_items (
+                  id TEXT PRIMARY KEY,
+                  run_id TEXT NOT NULL,
+                  session_id TEXT NOT NULL,
+                  planned_delete INTEGER NOT NULL,
+                  FOREIGN KEY(run_id) REFERENCES archive_runs(id) ON DELETE CASCADE,
+                  FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+                CREATE TABLE IF NOT EXISTS message_embeddings (
+                  message_id TEXT PRIMARY KEY,
+                  dim INTEGER NOT NULL,
+                  vec BLOB NOT NULL,
+                  FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
+                );
+                CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
+                  message_id UNINDEXED,
+                  session_id UNINDEXED,
+                  content,
+                  ts UNINDEXED,
+                  tokenize = 'unicode61 tokenchars ''_./:-'''
+                );
+                CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
+                CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
+                CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
+                CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id);
+                CREATE INDEX IF NOT EXISTS idx_artifacts_session_id ON artifacts(session_id);
+                CREATE INDEX IF NOT EXISTS idx_provenance_entity_id ON provenance(entity_id);
+                CREATE INDEX IF NOT EXISTS idx_archive_items_run_id ON archive_items(run_id);
+                CREATE INDEX IF NOT EXISTS idx_archive_items_session_id ON archive_items(session_id);
+                PRAGMA user_version = 1;
+                "#,
+            )?;
+        }
+        if version < 2 {
+            self.conn.execute_batch(
+                r#"
+                CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
+                CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
+                CREATE INDEX IF NOT EXISTS idx_sessions_updated_at ON sessions(updated_at);
+                CREATE INDEX IF NOT EXISTS idx_events_session_id ON events(session_id);
+                CREATE INDEX IF NOT EXISTS idx_artifacts_session_id ON artifacts(session_id);
+                CREATE INDEX IF NOT EXISTS idx_provenance_entity_id ON provenance(entity_id);
+                CREATE INDEX IF NOT EXISTS idx_archive_items_run_id ON archive_items(run_id);
+                CREATE INDEX IF NOT EXISTS idx_archive_items_session_id ON archive_items(session_id);
+                PRAGMA user_version = 2;
+                "#,
+            )?;
+        }
         for (id, name) in [
             ("pi", "pi"),
             ("droid", "droid"),
@@ -143,13 +181,13 @@ impl SqliteStore {
     pub fn save_batch(&mut self, batch: &NormalizedBatch) -> anyhow::Result<()> {
         let started = Instant::now();
         let mut last = started;
-        eprintln!(
-            "[store] save_batch start: sessions={}, messages={}, events={}, artifacts={}, provenance={}",
-            batch.sessions.len(),
-            batch.messages.len(),
-            batch.events.len(),
-            batch.artifacts.len(),
-            batch.provenance.len()
+        info!(
+            sessions = batch.sessions.len(),
+            messages = batch.messages.len(),
+            events = batch.events.len(),
+            artifacts = batch.artifacts.len(),
+            provenance = batch.provenance.len(),
+            "save_batch start"
         );
         let tx = self.conn.transaction()?;
         {
@@ -174,10 +212,10 @@ impl SqliteStore {
             }
         }
         let now = Instant::now();
-        eprintln!(
-            "[store] sessions upserted in {:.1?} (+{:.1?})",
-            now.duration_since(started),
-            now.duration_since(last)
+        info!(
+            elapsed = ?now.duration_since(started),
+            delta = ?now.duration_since(last),
+            "sessions upserted"
         );
         last = now;
         {
@@ -200,36 +238,29 @@ impl SqliteStore {
             }
         }
         let now = Instant::now();
-        eprintln!(
-            "[store] messages upserted in {:.1?} (+{:.1?})",
-            now.duration_since(started),
-            now.duration_since(last)
+        info!(
+            elapsed = ?now.duration_since(started),
+            delta = ?now.duration_since(last),
+            "messages upserted"
         );
         last = now;
         {
-            let mut sessions = BTreeSet::new();
+            let mut stmt_insert = tx.prepare_cached(
+                "INSERT INTO fts_messages (message_id, session_id, content, ts)
+                VALUES (?1, ?2, ?3, ?4)
+                ON CONFLICT(message_id) DO UPDATE SET
+                  content=excluded.content,
+                  ts=excluded.ts",
+            )?;
             for m in &batch.messages {
-                sessions.insert(m.session_id.clone());
-            }
-            if !sessions.is_empty() {
-                let placeholders = std::iter::repeat_n("?", sessions.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let delete_sql =
-                    format!("DELETE FROM fts_messages WHERE session_id IN ({placeholders})");
-                tx.execute(&delete_sql, params_from_iter(sessions.iter()))?;
-                let insert_sql = format!(
-                    "INSERT INTO fts_messages (message_id, session_id, content, ts) \
-                    SELECT id, session_id, content, ts FROM messages WHERE session_id IN ({placeholders})"
-                );
-                tx.execute(&insert_sql, params_from_iter(sessions.iter()))?;
+                stmt_insert.execute(params![m.id, m.session_id, m.content, m.ts.to_rfc3339()])?;
             }
         }
         let now = Instant::now();
-        eprintln!(
-            "[store] fts updated in {:.1?} (+{:.1?})",
-            now.duration_since(started),
-            now.duration_since(last)
+        info!(
+            elapsed = ?now.duration_since(started),
+            delta = ?now.duration_since(last),
+            "fts updated"
         );
         last = now;
         {
@@ -249,10 +280,10 @@ impl SqliteStore {
             }
         }
         let now = Instant::now();
-        eprintln!(
-            "[store] events upserted in {:.1?} (+{:.1?})",
-            now.duration_since(started),
-            now.duration_since(last)
+        info!(
+            elapsed = ?now.duration_since(started),
+            delta = ?now.duration_since(last),
+            "events upserted"
         );
         last = now;
         {
@@ -272,10 +303,10 @@ impl SqliteStore {
             }
         }
         let now = Instant::now();
-        eprintln!(
-            "[store] artifacts upserted in {:.1?} (+{:.1?})",
-            now.duration_since(started),
-            now.duration_since(last)
+        info!(
+            elapsed = ?now.duration_since(started),
+            delta = ?now.duration_since(last),
+            "artifacts upserted"
         );
         last = now;
         {
@@ -296,17 +327,17 @@ impl SqliteStore {
             }
         }
         let now = Instant::now();
-        eprintln!(
-            "[store] provenance upserted in {:.1?} (+{:.1?})",
-            now.duration_since(started),
-            now.duration_since(last)
+        info!(
+            elapsed = ?now.duration_since(started),
+            delta = ?now.duration_since(last),
+            "provenance upserted"
         );
         let commit_start = Instant::now();
         tx.commit()?;
-        eprintln!(
-            "[store] commit done in {:.1?} (total {:.1?})",
-            commit_start.elapsed(),
-            started.elapsed()
+        info!(
+            commit = ?commit_start.elapsed(),
+            total = ?started.elapsed(),
+            "commit done"
         );
         Ok(())
     }
@@ -338,6 +369,19 @@ impl SqliteStore {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    #[cfg(feature = "semantic")]
+    pub fn embedding_stats(&self) -> anyhow::Result<EmbeddingStats> {
+        let mut stmt = self.conn.prepare(
+            "SELECT COUNT(*), MAX(m.ts) FROM message_embeddings e LEFT JOIN messages m ON e.message_id = m.id",
+        )?;
+        let (count, ts): (i64, Option<String>) =
+            stmt.query_row([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(EmbeddingStats {
+            len: count as usize,
+            updated_at: ts.map(parse_ts),
+        })
     }
 
     pub fn get_checkpoint(&self, agent: &str) -> anyhow::Result<Option<String>> {
@@ -372,7 +416,7 @@ impl SqliteStore {
             let agent_str: String = r.get(1)?;
             Ok(Session {
                 id: r.get(0)?,
-                agent: parse_agent(&agent_str),
+                agent: parse_agent(&agent_str)?,
                 source_ref: r.get(2)?,
                 title: r.get(3)?,
                 created_at: parse_ts(r.get(4)?),
@@ -394,6 +438,43 @@ impl SqliteStore {
                 role: r.get(2)?,
                 content: r.get(3)?,
                 ts: parse_ts(r.get(4)?),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn get_session_events(&self, session_id: &str) -> anyhow::Result<Vec<core_model::Event>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, kind, payload, ts FROM events WHERE session_id = ?1 ORDER BY ts ASC",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| {
+            Ok(core_model::Event {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                kind: r.get(2)?,
+                payload: serde_json::from_str(&r.get::<_, String>(3)?).unwrap_or_default(),
+                ts: parse_ts(r.get(4)?),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn get_session_artifacts(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Vec<core_model::Artifact>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, path, checksum, metadata FROM artifacts WHERE session_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![session_id], |r| {
+            Ok(core_model::Artifact {
+                id: r.get(0)?,
+                session_id: r.get(1)?,
+                path: r.get(2)?,
+                checksum: r.get(3)?,
+                metadata: serde_json::from_str(&r.get::<_, String>(4)?).unwrap_or_default(),
             })
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
@@ -429,7 +510,7 @@ impl SqliteStore {
                     let agent_str: String = r.get(1)?;
                     Ok(Session {
                         id: r.get(0)?,
-                        agent: parse_agent(&agent_str),
+                        agent: parse_agent(&agent_str)?,
                         source_ref: r.get(2)?,
                         title: r.get(3)?,
                         created_at: parse_ts(r.get(4)?),
@@ -451,7 +532,7 @@ impl SqliteStore {
                 id: r.get(0)?,
                 entity_type: r.get(1)?,
                 entity_id: r.get(2)?,
-                agent: parse_agent(&agent_str),
+                agent: parse_agent(&agent_str)?,
                 source_path: r.get(4)?,
                 source_id: r.get(5)?,
             })
@@ -615,15 +696,14 @@ fn parse_ts(ts: String) -> DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
-fn parse_agent(s: &str) -> core_model::AgentKind {
-    match s {
-        "pi" => core_model::AgentKind::Pi,
-        "droid" => core_model::AgentKind::Droid,
-        "opencode" => core_model::AgentKind::OpenCode,
-        "claude" => core_model::AgentKind::Claude,
-        "amp" => core_model::AgentKind::Amp,
-        _ => core_model::AgentKind::OpenCode,
-    }
+fn parse_agent(s: &str) -> rusqlite::Result<core_model::AgentKind> {
+    s.parse::<core_model::AgentKind>().map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
+        )
+    })
 }
 
 #[cfg(test)]
