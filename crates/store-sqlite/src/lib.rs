@@ -245,14 +245,14 @@ impl SqliteStore {
         );
         last = now;
         {
+            let mut stmt_delete =
+                tx.prepare_cached("DELETE FROM fts_messages WHERE message_id = ?1")?;
             let mut stmt_insert = tx.prepare_cached(
                 "INSERT INTO fts_messages (message_id, session_id, content, ts)
-                VALUES (?1, ?2, ?3, ?4)
-                ON CONFLICT(message_id) DO UPDATE SET
-                  content=excluded.content,
-                  ts=excluded.ts",
+                VALUES (?1, ?2, ?3, ?4)",
             )?;
             for m in &batch.messages {
+                stmt_delete.execute(params![m.id])?;
                 stmt_insert.execute(params![m.id, m.session_id, m.content, m.ts.to_rfc3339()])?;
             }
         }
