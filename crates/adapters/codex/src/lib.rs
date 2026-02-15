@@ -7,25 +7,19 @@ use core_model::{
 use rayon::prelude::*;
 use serde_json::Value;
 
-pub struct DroidAdapter;
+pub struct CodexAdapter;
 
-impl AgentAdapter for DroidAdapter {
+impl AgentAdapter for CodexAdapter {
     fn kind(&self) -> AgentKind {
-        AgentKind::Droid
+        AgentKind::Codex
     }
 
     fn discover_source_paths(&self) -> anyhow::Result<Vec<String>> {
         let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let mut out = Vec::new();
-        out.extend(adapter_common::collect_files_with_ext(
-            &base.join(".factory/sessions"),
+        Ok(adapter_common::collect_files_with_ext(
+            &base.join(".codex/sessions"),
             "jsonl",
-        ));
-        out.extend(adapter_common::collect_files_with_ext(
-            &base.join(".local/share/factory-droid/sessions"),
-            "jsonl",
-        ));
-        Ok(out)
+        ))
     }
 
     fn scan_changes_since(
@@ -33,7 +27,7 @@ impl AgentAdapter for DroidAdapter {
         source_paths: &[String],
         cursor: Option<&str>,
     ) -> anyhow::Result<Vec<NativeRecord>> {
-        load_droid_jsonl(source_paths, cursor)
+        load_rollout_jsonl(source_paths, cursor)
     }
 
     fn normalize(&self, records: &[NativeRecord]) -> anyhow::Result<NormalizedBatch> {
@@ -55,48 +49,7 @@ fn parse_rfc3339(input: &str) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
-fn extract_text_only(content: Option<&Value>) -> String {
-    let Some(Value::Array(arr)) = content else {
-        if let Some(Value::String(s)) = content {
-            return s.clone();
-        }
-        return String::new();
-    };
-    let mut texts = Vec::new();
-    for item in arr {
-        let Some(obj) = item.as_object() else {
-            continue;
-        };
-        let kind = obj.get("type").and_then(Value::as_str).unwrap_or("");
-        if kind != "text" {
-            continue;
-        }
-        if let Some(text) = obj.get("text").and_then(Value::as_str) {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                texts.push(trimmed.to_string());
-            }
-        }
-    }
-    texts.join("\n")
-}
-
-fn has_only_tool_blocks(content: Option<&Value>) -> bool {
-    let Some(Value::Array(arr)) = content else {
-        return false;
-    };
-    if arr.is_empty() {
-        return true;
-    }
-    arr.iter().all(|item| {
-        let Some(kind) = item.get("type").and_then(Value::as_str) else {
-            return false;
-        };
-        matches!(kind, "tool_use" | "tool_result")
-    })
-}
-
-fn load_droid_jsonl(
+fn load_rollout_jsonl(
     source_paths: &[String],
     cursor: Option<&str>,
 ) -> anyhow::Result<Vec<NativeRecord>> {
@@ -123,7 +76,6 @@ fn load_droid_jsonl(
             }
 
             let mut session_id = String::new();
-            let mut session_title: Option<String> = None;
             let mut session_ts: Option<DateTime<Utc>> = None;
             let mut cwd: Option<String> = None;
             let mut first_user_text: Option<String> = None;
@@ -140,68 +92,50 @@ fn load_droid_jsonl(
                 };
 
                 let line_type = val.get("type").and_then(Value::as_str).unwrap_or("");
+                let line_ts = val
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(parse_rfc3339)
+                    .or(file_mtime)
+                    .unwrap_or_else(Utc::now);
 
                 match line_type {
-                    "session_start" => {
-                        if let Some(id) = val.get("id").and_then(Value::as_str) {
-                            session_id = id.to_string();
+                    "session_meta" => {
+                        if let Some(payload) = val.get("payload") {
+                            if let Some(id) = payload.get("id").and_then(Value::as_str) {
+                                session_id = id.to_string();
+                            }
+                            if let Some(dir) = payload.get("cwd").and_then(Value::as_str) {
+                                cwd = Some(dir.to_string());
+                            }
                         }
-                        if let Some(st) = val.get("sessionTitle").and_then(Value::as_str)
-                            && !st.is_empty()
-                        {
-                            session_title = Some(st.to_string());
-                        }
-                        if session_title.is_none()
-                            && let Some(t) = val.get("title").and_then(Value::as_str)
-                            && !t.is_empty()
-                        {
-                            session_title = Some(t.to_string());
-                        }
-                        if let Some(dir) = val.get("cwd").and_then(Value::as_str) {
-                            cwd = Some(dir.to_string());
-                        }
-                        let header_ts = val
-                            .get("timestamp")
-                            .and_then(Value::as_str)
-                            .and_then(parse_rfc3339)
-                            .or(file_mtime);
                         if session_ts.is_none() {
-                            session_ts = header_ts;
+                            session_ts = Some(line_ts);
                         }
                     }
-                    "message" => {
-                        let Some(message) = val.get("message") else {
+                    "response_item" => {
+                        let Some(payload) = val.get("payload") else {
                             continue;
                         };
-                        let content = message.get("content");
-
-                        if has_only_tool_blocks(content) {
+                        if payload.get("type").and_then(Value::as_str) != Some("message") {
                             continue;
                         }
-
-                        let text = extract_text_only(content);
-                        if text.is_empty() {
-                            continue;
-                        }
-
-                        let role = message
+                        let role = payload
                             .get("role")
                             .and_then(Value::as_str)
                             .unwrap_or("user");
-
-                        if role == "user" && first_user_text.is_none() {
-                            first_user_text = Some(text.clone());
+                        if role == "developer" || role == "system" {
+                            continue;
                         }
 
-                        let line_ts = val
-                            .get("timestamp")
-                            .and_then(Value::as_str)
-                            .and_then(parse_rfc3339)
-                            .or(file_mtime)
-                            .unwrap_or_else(Utc::now);
+                        let content_text =
+                            adapter_common::extract_content_text(payload.get("content"));
+                        if content_text.is_empty() {
+                            continue;
+                        }
 
-                        if session_ts.is_none() {
-                            session_ts = Some(line_ts);
+                        if role == "user" && first_user_text.is_none() {
+                            first_user_text = Some(content_text.clone());
                         }
 
                         let sid = if session_id.is_empty() {
@@ -222,25 +156,23 @@ fn load_droid_jsonl(
                             continue;
                         }
 
-                        let title = session_title
-                            .clone()
-                            .or_else(|| {
-                                first_user_text.as_deref().map(|t| {
-                                    if t.len() > 80 {
-                                        format!("{}…", &t[..80])
-                                    } else {
-                                        t.to_string()
-                                    }
-                                })
+                        let title = first_user_text
+                            .as_deref()
+                            .map(|t| {
+                                if t.len() > 80 {
+                                    format!("{}…", &t[..80])
+                                } else {
+                                    t.to_string()
+                                }
                             })
                             .unwrap_or_else(|| sid.clone());
 
                         let mut obj = serde_json::Map::new();
                         obj.insert("role".to_string(), Value::String(role.to_string()));
-                        obj.insert(
-                            "content".to_string(),
-                            Value::Array(vec![Value::String(text)]),
-                        );
+                        obj.insert("content".to_string(), Value::Array(vec![]));
+                        if let Some(content) = payload.get("content") {
+                            obj.insert("content".to_string(), content.clone());
+                        }
                         obj.insert("__thread_id".to_string(), Value::String(sid.clone()));
                         obj.insert("__thread_title".to_string(), Value::String(title));
                         if let Some(ts) = session_ts {
@@ -274,7 +206,7 @@ fn load_droid_jsonl(
 }
 
 fn normalize_records(records: &[NativeRecord]) -> NormalizedBatch {
-    let kind = AgentKind::Droid;
+    let kind = AgentKind::Codex;
     let mut batch = NormalizedBatch::default();
     let mut sessions: std::collections::HashMap<String, core_model::Session> =
         std::collections::HashMap::new();
@@ -286,14 +218,7 @@ fn normalize_records(records: &[NativeRecord]) -> NormalizedBatch {
             .and_then(Value::as_str)
             .unwrap_or("user")
             .to_string();
-        let content = rec
-            .payload
-            .get("content")
-            .and_then(Value::as_array)
-            .and_then(|arr| arr.first())
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let content = adapter_common::extract_content_text(rec.payload.get("content"));
         if content.is_empty() {
             continue;
         }
@@ -382,14 +307,14 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir =
-            std::env::temp_dir().join(format!("remi_droid_test_{}_{}", std::process::id(), id));
+            std::env::temp_dir().join(format!("remi_codex_test_{}_{}", std::process::id(), id));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
 
-    fn write_session(dir: &std::path::Path, lines: &[&str]) -> String {
-        let file = dir.join("session.jsonl");
+    fn write_rollout(dir: &std::path::Path, lines: &[&str]) -> String {
+        let file = dir.join("rollout.jsonl");
         let mut f = fs::File::create(&file).unwrap();
         for line in lines {
             writeln!(f, "{line}").unwrap();
@@ -398,28 +323,20 @@ mod tests {
     }
 
     #[test]
-    fn load_droid_session_basic() {
+    fn load_rollout_jsonl_basic() {
         let dir = tempdir();
-        let path = write_session(
+        let path = write_rollout(
             &dir,
             &[
-                r#"{"type":"session_start","id":"sess-1","title":"build release","sessionTitle":"Build Release","cwd":"/home/user/project"}"#,
-                r#"{"type":"message","id":"m1","timestamp":"2026-02-11T09:52:37.424Z","message":{"role":"user","content":[{"type":"text","text":"build a bundled release"}]}}"#,
-                r#"{"type":"message","id":"m2","timestamp":"2026-02-11T09:52:41.189Z","message":{"role":"assistant","content":[{"type":"text","text":"I'll build a bundled release"}]}}"#,
+                r#"{"timestamp":"2025-01-15T10:30:00Z","type":"session_meta","payload":{"id":"sess-1","cwd":"/home/user/project","cli_version":"0.1.0","source":"cli"}}"#,
+                r#"{"timestamp":"2025-01-15T10:30:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello world"}]}}"#,
+                r#"{"timestamp":"2025-01-15T10:30:02Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi there"}]}}"#,
             ],
         );
-        let records = load_droid_jsonl(&[path], None).unwrap();
+        let records = load_rollout_jsonl(&[path], None).unwrap();
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].source_id, "sess-1:0");
         assert_eq!(records[1].source_id, "sess-1:1");
-        assert_eq!(
-            records[0].payload.get("role").unwrap().as_str().unwrap(),
-            "user"
-        );
-        assert_eq!(
-            records[1].payload.get("role").unwrap().as_str().unwrap(),
-            "assistant"
-        );
         assert_eq!(
             records[0]
                 .payload
@@ -438,47 +355,14 @@ mod tests {
                 .unwrap(),
             "/home/user/project"
         );
-        assert_eq!(
-            records[0]
-                .payload
-                .get("__thread_title")
-                .unwrap()
-                .as_str()
-                .unwrap(),
-            "Build Release"
-        );
     }
 
     #[test]
-    fn skip_tool_only_messages() {
-        let dir = tempdir();
-        let path = write_session(
-            &dir,
-            &[
-                r#"{"type":"session_start","id":"sess-2","sessionTitle":"Test","cwd":"/tmp"}"#,
-                r#"{"type":"message","id":"m1","timestamp":"2026-02-11T09:52:37.424Z","message":{"role":"user","content":[{"type":"text","text":"do something"}]}}"#,
-                r#"{"type":"message","id":"m2","timestamp":"2026-02-11T09:52:41.189Z","message":{"role":"assistant","content":[{"type":"text","text":"Sure"},{"type":"tool_use","id":"call_xxx","name":"Execute","input":{}}]}}"#,
-                r#"{"type":"message","id":"m3","timestamp":"2026-02-11T09:52:44.410Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_xxx","content":"Output"}]}}"#,
-                r#"{"type":"message","id":"m4","timestamp":"2026-02-11T09:52:45.000Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"call_yyy","name":"Read","input":{}}]}}"#,
-                r#"{"type":"todo_state","id":"t1","timestamp":"2026-02-11T09:52:45.500Z","todos":{"todos":"1. [done] Done"}}"#,
-                r#"{"type":"message","id":"m5","timestamp":"2026-02-11T09:52:46.000Z","message":{"role":"assistant","content":[{"type":"text","text":"All done"}]}}"#,
-            ],
-        );
-        let records = load_droid_jsonl(&[path], None).unwrap();
-        assert_eq!(records.len(), 3);
-        let roles: Vec<&str> = records
-            .iter()
-            .map(|r| r.payload.get("role").unwrap().as_str().unwrap())
-            .collect();
-        assert_eq!(roles, vec!["user", "assistant", "assistant"]);
-    }
-
-    #[test]
-    fn normalize_droid_session() {
-        let ts1 = DateTime::parse_from_rfc3339("2026-02-11T09:52:37.424Z")
+    fn normalize_codex_session() {
+        let ts1 = DateTime::parse_from_rfc3339("2025-01-15T10:30:01Z")
             .unwrap()
             .with_timezone(&Utc);
-        let ts2 = DateTime::parse_from_rfc3339("2026-02-11T09:52:41.189Z")
+        let ts2 = DateTime::parse_from_rfc3339("2025-01-15T10:30:02Z")
             .unwrap()
             .with_timezone(&Utc);
         let records = vec![
@@ -487,11 +371,11 @@ mod tests {
                 updated_at: ts1,
                 payload: serde_json::json!({
                     "role": "user",
-                    "content": ["build a bundled release"],
+                    "content": [{"type": "input_text", "text": "hello world"}],
                     "__thread_id": "sess-1",
-                    "__thread_title": "Build Release",
-                    "__thread_ts": "2026-02-11T09:52:37.424Z",
-                    "__source_path": "/tmp/session.jsonl",
+                    "__thread_title": "hello world",
+                    "__thread_ts": "2025-01-15T10:30:00Z",
+                    "__source_path": "/tmp/rollout.jsonl",
                     "__workspace_path": "/home/user/project"
                 }),
             },
@@ -500,11 +384,11 @@ mod tests {
                 updated_at: ts2,
                 payload: serde_json::json!({
                     "role": "assistant",
-                    "content": ["I'll build a bundled release"],
+                    "content": [{"type": "output_text", "text": "hi there"}],
                     "__thread_id": "sess-1",
-                    "__thread_title": "Build Release",
-                    "__thread_ts": "2026-02-11T09:52:37.424Z",
-                    "__source_path": "/tmp/session.jsonl",
+                    "__thread_title": "hello world",
+                    "__thread_ts": "2025-01-15T10:30:00Z",
+                    "__source_path": "/tmp/rollout.jsonl",
                     "__workspace_path": "/home/user/project"
                 }),
             },
@@ -515,73 +399,34 @@ mod tests {
         assert_eq!(batch.messages.len(), 2);
         assert_eq!(batch.provenance.len(), 2);
         assert_eq!(batch.sessions[0].source_ref, "sess-1");
-        assert_eq!(batch.sessions[0].title, "Build Release");
-        assert_eq!(batch.sessions[0].agent, AgentKind::Droid);
+        assert_eq!(batch.sessions[0].title, "hello world");
+        assert_eq!(batch.sessions[0].agent, AgentKind::Codex);
         assert_eq!(batch.messages[0].role, "user");
-        assert_eq!(batch.messages[0].content, "build a bundled release");
+        assert_eq!(batch.messages[0].content, "hello world");
         assert_eq!(batch.messages[1].role, "assistant");
-        assert_eq!(batch.messages[1].content, "I'll build a bundled release");
+        assert_eq!(batch.messages[1].content, "hi there");
         assert_eq!(batch.provenance[0].source_path, "/home/user/project");
     }
 
     #[test]
-    fn session_title_from_header() {
+    fn skip_developer_and_system_roles() {
         let dir = tempdir();
-        let path = write_session(
+        let path = write_rollout(
             &dir,
             &[
-                r#"{"type":"session_start","id":"sess-3","title":"raw title","sessionTitle":"Clean Title","cwd":"/tmp"}"#,
-                r#"{"type":"message","id":"m1","timestamp":"2026-02-11T10:00:00Z","message":{"role":"user","content":[{"type":"text","text":"first user message as fallback"}]}}"#,
+                r#"{"timestamp":"2025-01-15T10:30:00Z","type":"session_meta","payload":{"id":"sess-2","cwd":"/tmp"}}"#,
+                r#"{"timestamp":"2025-01-15T10:30:01Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"text","text":"system prompt"}]}}"#,
+                r#"{"timestamp":"2025-01-15T10:30:02Z","type":"response_item","payload":{"type":"message","role":"system","content":[{"type":"text","text":"instructions"}]}}"#,
+                r#"{"timestamp":"2025-01-15T10:30:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"real question"}]}}"#,
+                r#"{"timestamp":"2025-01-15T10:30:04Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"real answer"}]}}"#,
             ],
         );
-        let records = load_droid_jsonl(&[path], None).unwrap();
-        assert_eq!(records.len(), 1);
-        assert_eq!(
-            records[0]
-                .payload
-                .get("__thread_title")
-                .unwrap()
-                .as_str()
-                .unwrap(),
-            "Clean Title"
-        );
-
-        let dir2 = tempdir();
-        let path2 = write_session(
-            &dir2,
-            &[
-                r#"{"type":"session_start","id":"sess-4","title":"fallback title","cwd":"/tmp"}"#,
-                r#"{"type":"message","id":"m1","timestamp":"2026-02-11T10:00:00Z","message":{"role":"user","content":[{"type":"text","text":"user msg"}]}}"#,
-            ],
-        );
-        let records2 = load_droid_jsonl(&[path2], None).unwrap();
-        assert_eq!(
-            records2[0]
-                .payload
-                .get("__thread_title")
-                .unwrap()
-                .as_str()
-                .unwrap(),
-            "fallback title"
-        );
-
-        let dir3 = tempdir();
-        let path3 = write_session(
-            &dir3,
-            &[
-                r#"{"type":"session_start","id":"sess-5","cwd":"/tmp"}"#,
-                r#"{"type":"message","id":"m1","timestamp":"2026-02-11T10:00:00Z","message":{"role":"user","content":[{"type":"text","text":"user msg as title"}]}}"#,
-            ],
-        );
-        let records3 = load_droid_jsonl(&[path3], None).unwrap();
-        assert_eq!(
-            records3[0]
-                .payload
-                .get("__thread_title")
-                .unwrap()
-                .as_str()
-                .unwrap(),
-            "user msg as title"
-        );
+        let records = load_rollout_jsonl(&[path], None).unwrap();
+        assert_eq!(records.len(), 2);
+        let roles: Vec<&str> = records
+            .iter()
+            .map(|r| r.payload.get("role").unwrap().as_str().unwrap())
+            .collect();
+        assert_eq!(roles, vec!["user", "assistant"]);
     }
 }

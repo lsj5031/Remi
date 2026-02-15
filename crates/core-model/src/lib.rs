@@ -10,6 +10,7 @@ pub enum AgentKind {
     OpenCode,
     Claude,
     Amp,
+    Codex,
 }
 
 impl AgentKind {
@@ -20,6 +21,7 @@ impl AgentKind {
             AgentKind::OpenCode => "opencode",
             AgentKind::Claude => "claude",
             AgentKind::Amp => "amp",
+            AgentKind::Codex => "codex",
         }
     }
 }
@@ -40,6 +42,7 @@ impl std::str::FromStr for AgentKind {
             "opencode" => Ok(AgentKind::OpenCode),
             "claude" => Ok(AgentKind::Claude),
             "amp" => Ok(AgentKind::Amp),
+            "codex" => Ok(AgentKind::Codex),
             _ => anyhow::bail!("unknown agent kind: {s}"),
         }
     }
@@ -193,5 +196,6 @@ mod tests {
         assert_eq!(AgentKind::OpenCode.as_str(), "opencode");
         assert_eq!(AgentKind::Claude.as_str(), "claude");
         assert_eq!(AgentKind::Amp.as_str(), "amp");
+        assert_eq!(AgentKind::Codex.as_str(), "codex");
     }
 }
