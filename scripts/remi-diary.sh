@@ -203,6 +203,26 @@ if [[ -n "$sessions_tsv" ]]; then
       echo "amp-thread"
       return
     fi
+    if [[ "$path" == *"/.factory/sessions/"* ]]; then
+      local rel="${path#*/.factory/sessions/}"
+      local dir_name="${rel%%/*}"
+      local home_dir_esc="${home_dir//\//-}"
+      home_dir_esc="${home_dir_esc#-}"
+      if [[ "$dir_name" == -mnt-t-* ]]; then
+        dir_name="${dir_name#-mnt-t-}"
+      elif [[ "$dir_name" == -mnt-* ]]; then
+        dir_name="${dir_name#-mnt-}"
+      elif [[ "$dir_name" == "-${home_dir_esc}-"* ]]; then
+        dir_name="${dir_name#"-${home_dir_esc}-"}"
+      fi
+      dir_name="${dir_name//-//}"
+      echo "${dir_name:-pi}"
+      return
+    fi
+    if [[ "$path" == *"/.pi/"* ]]; then
+      echo "pi"
+      return
+    fi
 
     if [[ "$path" == "$home_dir/code/"* ]]; then
       local rel="${path#"$home_dir/code/"}"
