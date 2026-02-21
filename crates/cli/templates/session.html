@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{{ title }} - Remi</title>
+    <style>
+        :root {
+            --bg: #fafafa;
+            --bg-surface: #ffffff;
+            --bg-subtle: #f4f4f5;
+            --text: #18181b;
+            --text-muted: #71717a;
+            --border: #e4e4e7;
+            --accent: #3b82f6;
+            --user-bg: #eff6ff;
+            --user-border: #bfdbfe;
+            --code-bg: #f4f4f5;
+
+            --diff-add-bg: #dcfce7;
+            --diff-add-text: #166534;
+            --diff-rem-bg: #fee2e2;
+            --diff-rem-text: #991b1b;
+
+            --font-sans: "Inter", system-ui, -apple-system, sans-serif;
+            --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+        }
+
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #09090b;
+                --bg-surface: #18181b;
+                --bg-subtle: #27272a;
+                --text: #f4f4f5;
+                --text-muted: #a1a1aa;
+                --border: #27272a;
+                --user-bg: rgba(59, 130, 246, 0.1);
+                --user-border: rgba(59, 130, 246, 0.2);
+                --code-bg: #18181b;
+
+                --diff-add-bg: rgba(34, 197, 94, 0.15);
+                --diff-add-text: #4ade80;
+                --diff-rem-bg: rgba(239, 68, 68, 0.15);
+                --diff-rem-text: #f87171;
+            }
+        }
+
+        body { font-family: var(--font-sans); background: var(--bg); color: var(--text); margin: 0; line-height: 1.6; padding-bottom: 4rem; }
+        .header-wrapper { position: sticky; top: 0; background: color-mix(in srgb, var(--bg) 80%, transparent); backdrop-filter: blur(12px); border-bottom: 1px solid var(--border); padding: 1.5rem 0; z-index: 50; }
+        .container { max-width: 900px; margin: 0 auto; padding: 0 1.5rem; }
+        h1 { font-size: 1.25rem; margin: 0 0 0.5rem 0; font-weight: 600; letter-spacing: -0.02em; }
+        .meta { display: flex; gap: 1rem; font-size: 0.85rem; color: var(--text-muted); }
+
+        .message { border-bottom: 1px solid var(--border); }
+        .message.user { background: var(--user-bg); }
+        .message.tool { background: var(--bg-subtle); }
+        .message-inner { max-width: 900px; margin: 0 auto; padding: 2.5rem 1.5rem; }
+        .role-badge { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-bottom: 1rem; display: flex; align-items: center; gap: 0.5rem; }
+        .message.user .role-badge { color: var(--accent); }
+        .message.tool .role-badge { color: var(--text-muted); }
+        .timestamp { font-weight: 400; color: var(--text-muted); text-transform: none; letter-spacing: 0; }
+
+        .content p { margin: 0 0 1rem 0; }
+        .content p:last-child { margin-bottom: 0; }
+        .content code { font-family: var(--font-mono); font-size: 0.85em; background: var(--bg-subtle); padding: 0.2em 0.4em; border-radius: 4px; border: 1px solid var(--border); }
+        .content pre { background: var(--code-bg); padding: 1rem; border-radius: 8px; overflow-x: auto; border: 1px solid var(--border); margin: 1.5rem 0; }
+        .content pre code { background: transparent; padding: 0; border: none; }
+
+        details.tool-block { background: var(--bg-surface); border: 1px solid var(--border); border-radius: 8px; margin: 1.5rem 0; overflow: hidden; }
+        details.tool-block > summary { background: var(--bg-subtle); padding: 0.75rem 1rem; cursor: pointer; font-family: var(--font-mono); font-size: 0.85rem; font-weight: 600; color: var(--text-muted); user-select: none; transition: background 0.2s; }
+        details.tool-block > summary:hover { background: var(--border); color: var(--text); }
+        details.tool-block[open] > summary { border-bottom: 1px solid var(--border); color: var(--text); }
+        .tool-content { padding: 1rem; max-height: 400px; overflow-y: auto; font-family: var(--font-mono); font-size: 0.8rem; background: var(--bg-surface); }
+        .tool-content pre { margin: 0; padding: 0; border: none; background: transparent; }
+
+        details.tool-block[open] summary ~ * { animation: slideDown 0.2s ease-out; }
+        @keyframes slideDown { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
+
+        .diff-viewer { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; margin: 1.5rem 0; font-family: var(--font-mono); font-size: 0.85rem; }
+        .diff-header { background: var(--bg-subtle); padding: 0.5rem 1rem; border-bottom: 1px solid var(--border); color: var(--text-muted); font-weight: 600; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }
+        .diff-table { width: 100%; border-collapse: collapse; background: var(--bg-surface); }
+        .diff-marker { width: 1%; padding: 0 0.5rem; color: var(--text-muted); user-select: none; text-align: right; border-right: 1px solid var(--border); }
+        .diff-code { width: 99%; padding: 0 1rem; white-space: pre-wrap; word-break: break-all; }
+        .diff-add { background: var(--diff-add-bg); color: var(--diff-add-text); }
+        .diff-rem { background: var(--diff-rem-bg); color: var(--diff-rem-text); }
+        .diff-hunk { background: var(--bg-subtle); color: var(--text-muted); }
+    </style>
+</head>
+<body>
+    <div class="header-wrapper">
+        <div class="container">
+            <h1>{{ title }}</h1>
+            <div class="meta">
+                <span>Agent: <strong>{{ agent }}</strong></span>
+                <span>ID: {{ id }}</span>
+                <span>{{ message_count }} messages</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="messages">
+        {% for msg in messages %}
+        <div class="message {% if msg.is_user %}user{% endif %}{% if msg.is_tool %} tool{% endif %}">
+            <div class="message-inner">
+                <div class="role-badge">
+                    {{ msg.role }} <span class="timestamp">{{ msg.ts }}</span>
+                </div>
+                <div class="content">
+                    {{ msg.content_html|safe }}
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+</body>
+</html>

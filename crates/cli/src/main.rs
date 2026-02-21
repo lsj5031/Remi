@@ -3,11 +3,13 @@ use std::{cell::RefCell, path::PathBuf, time::Instant};
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ingest::SyncPhase;
+use render::HtmlSafety;
 use store_sqlite::SqliteStore;
 use tracing::info;
 
 #[cfg(feature = "semantic")]
 mod config;
+mod render;
 mod ui;
 
 #[derive(Parser)]
@@ -93,6 +95,8 @@ enum SearchCommand {
         contains: Option<String>,
         #[arg(long, default_value_t = false)]
         raw_fts: bool,
+        #[arg(long, value_enum, default_value_t = HtmlSafety::Relaxed)]
+        html_safety: HtmlSafety,
         #[cfg(feature = "semantic")]
         #[arg(long, value_enum, default_value_t = SemanticMode::Auto)]
         semantic: SemanticMode,
@@ -291,6 +295,7 @@ fn main() -> anyhow::Result<()> {
                 id,
                 contains,
                 raw_fts,
+                html_safety,
                 #[cfg(feature = "semantic")]
                 semantic,
                 output_dir,
@@ -405,8 +410,10 @@ fn main() -> anyhow::Result<()> {
                     .with_context(|| "selected session missing")?;
                 let messages = store.get_session_messages(&selected.session_id)?;
                 let rendered = match format {
-                    SearchFormat::Html => ui::render_session_html(&session, &messages),
-                    SearchFormat::Markdown => ui::render_session_markdown(&session, &messages),
+                    SearchFormat::Html => {
+                        render::render_session_html(&session, &messages, html_safety)?
+                    }
+                    SearchFormat::Markdown => render::render_session_markdown(&session, &messages),
                     SearchFormat::Json => unreachable!("handled earlier"),
                 };
                 let out_dir = ui::resolve_output_dir(output_dir)?;

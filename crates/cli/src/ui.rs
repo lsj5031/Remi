@@ -308,57 +308,6 @@ pub fn truncate_text(input: &str, max: usize) -> String {
     out
 }
 
-pub fn render_session_html(session: &Session, messages: &[Message]) -> String {
-    let title = escape_html(&session.title);
-    let mut body = String::new();
-    body.push_str("<!doctype html><html><head><meta charset=\"utf-8\">");
-    body.push_str("<style>body{font-family:system-ui,Arial,sans-serif;max-width:900px;margin:2rem auto;line-height:1.5}h1{font-size:1.6rem} .meta{color:#555;font-size:.9rem;margin-bottom:1rem} .msg{padding:.6rem .8rem;border:1px solid #e3e3e3;border-radius:8px;margin:.6rem 0} .role{font-weight:600;margin-bottom:.4rem} pre{white-space:pre-wrap}</style></head><body>");
-    body.push_str(&format!("<h1>{}</h1>", title));
-    body.push_str(&format!(
-        "<div class=\"meta\">Session {} · {} · {} messages</div>",
-        escape_html(&session.id),
-        escape_html(session.agent.as_str()),
-        messages.len()
-    ));
-    for msg in messages {
-        let role = escape_html(&msg.role);
-        let ts = escape_html(&msg.ts.to_rfc3339());
-        let content = escape_html(&msg.content);
-        body.push_str("<div class=\"msg\">");
-        body.push_str(&format!("<div class=\"role\">{} · {}</div>", role, ts));
-        body.push_str(&format!("<pre>{}</pre>", content));
-        body.push_str("</div>");
-    }
-    body.push_str("</body></html>");
-    body
-}
-
-pub fn render_session_markdown(session: &Session, messages: &[Message]) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("# {}\n\n", session.title));
-    out.push_str(&format!(
-        "Session `{}` · `{}` · {} messages\n\n",
-        session.id,
-        session.agent.as_str(),
-        messages.len()
-    ));
-    for msg in messages {
-        out.push_str(&format!("## {} ({})\n\n", msg.role, msg.ts.to_rfc3339()));
-        out.push_str(&msg.content);
-        out.push_str("\n\n");
-    }
-    out
-}
-
-pub fn escape_html(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#39;")
-}
-
 pub fn resolve_output_dir(dir: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     let base = if let Some(dir) = dir {
         dir
