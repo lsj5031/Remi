@@ -27,7 +27,7 @@ jobs:
         run: cargo test --workspace
 
       - name: Build release binary
-        run: cargo build --workspace --release
+        run: cargo build -p cli --release
 
       - name: Prepare simple artifact
         run: |
@@ -72,3 +72,59 @@ jobs:
           files: |
             remi-linux-x64-simple.tar.gz
             remi-linux-x64-bundled.tar.gz
+
+  build-simple-cross:
+    needs: build-linux
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            platform: macos
+          - os: windows-latest
+            platform: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build -p cli --release
+
+      - name: Package macOS artifact
+        if: matrix.platform == 'macos'
+        id: package-macos
+        shell: bash
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          case "$arch" in
+            x86_64) arch_label="x64" ;;
+            arm64|aarch64) arch_label="arm64" ;;
+            *) arch_label="$arch" ;;
+          esac
+          asset="remi-macos-${arch_label}-simple.tar.gz"
+          tar -czf "${asset}" -C target/release remi
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - name: Package Windows artifact
+        if: matrix.platform == 'windows'
+        id: package-windows
+        shell: pwsh
+        run: |
+          $archLabel = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+          $asset = "remi-windows-$archLabel-simple.zip"
+          Compress-Archive -Path target/release/remi.exe -DestinationPath $asset -Force
+          "asset=$asset" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload macOS release asset
+        if: matrix.platform == 'macos'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package-macos.outputs.asset }}
+
+      - name: Upload Windows release asset
+        if: matrix.platform == 'windows'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package-windows.outputs.asset }}

@@ -1,14 +1,24 @@
 # Remi
 
+[![CI](https://github.com/lsj5031/Remi/actions/workflows/ci.yml/badge.svg)](https://github.com/lsj5031/Remi/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/lsj5031/Remi?display_name=tag)](https://github.com/lsj5031/Remi/releases)
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+
 Unified coding-agent session memory for **Pi**, **Factory Droid**, **OpenCode**, **Claude Code**, and **Amp**.
 
+Tired of hunting through multiple agent transcript formats and folders? Remi gives you one searchable memory layer.
+
 Remi ingests local agent transcripts into one SQLite database, keeps sync state with checkpoints, supports ranked search, and provides safe archive/restore workflows.
+
+Current support status: **Linux-first** (default source discovery paths are validated on Linux).
 
 ---
 
 ## Table of contents
 
 - [What Remi does](#what-remi-does)
+- [Demo](#demo)
+- [Quickstart](#quickstart)
 - [Install / build](#install--build)
 - [Data locations](#data-locations)
 - [Supported agent sources](#supported-agent-sources)
@@ -24,6 +34,7 @@ Remi ingests local agent transcripts into one SQLite database, keeps sync state 
 - [Helper scripts (examples)](#helper-scripts-examples)
 - [Architecture at a glance](#architecture-at-a-glance)
 - [Release artifacts](#release-artifacts)
+- [Homebrew (optional)](#homebrew-optional)
 - [License](#license)
 
 ---
@@ -42,7 +53,43 @@ Remi ingests local agent transcripts into one SQLite database, keeps sync state 
 
 ---
 
+## Demo
+
+Full CLI demo (55s):
+
+![Remi CLI demo](docs/assets/remi-demo.gif)
+
+---
+
+## Quickstart
+
+```bash
+remi init && remi sync --agent all && remi search query "panic"
+```
+
+If `remi` is not on your path yet, run from source:
+
+```bash
+cargo run -p cli -- init
+cargo run -p cli -- sync --agent all
+cargo run -p cli -- search query "panic"
+```
+
+---
+
 ## Install / build
+
+### Install from source
+
+```bash
+cargo install --path crates/cli
+```
+
+### Install from git (optional)
+
+```bash
+cargo install --git https://github.com/lsj5031/Remi --bin remi
+```
 
 ### Build workspace
 
@@ -56,14 +103,6 @@ cargo build --workspace
 cargo run -p cli -- --help
 ```
 
-### Install binary locally (optional)
-
-```bash
-cargo install --path crates/cli
-```
-
-This installs the `remi` binary.
-
 ---
 
 ## Data locations
@@ -73,6 +112,8 @@ Default paths on Linux (via `dirs` crate):
 - **Database**: `~/.local/share/remi/remi.db`
 - **Search exports** (HTML/Markdown default output): `~/.local/share/remi/exports/`
 - **Archive bundles**: `~/.local/share/remi/archive/<run_id>/`
+
+macOS and Windows builds are available in releases, but default agent source discovery paths are currently Linux-oriented.
 
 ---
 
@@ -505,6 +546,26 @@ GitHub release workflow publishes:
 
 - `remi-linux-x64-simple.tar.gz` (binary only)
 - `remi-linux-x64-bundled.tar.gz` (binary + ONNX Runtime + BGE model files)
+
+As of `v0.0.4` (February 11, 2026), published assets are Linux x64.
+The workflow in this repo is set up to also produce macOS/Windows simple artifacts on future tagged releases.
+
+---
+
+## Homebrew (optional)
+
+Homebrew tap setup (recommended layout):
+
+1. Create a tap repo, e.g. `lsj5031/homebrew-remi`.
+2. Start from this repo’s `Formula/remi.rb` and update URL/version/SHA per tagged release.
+3. Update SHA256 per release.
+
+End-user install:
+
+```bash
+brew tap lsj5031/remi
+brew install remi
+```
 
 ---
 
