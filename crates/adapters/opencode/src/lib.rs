@@ -22,15 +22,16 @@ impl AgentAdapter for OpenCodeAdapter {
 
     fn discover_source_paths(&self) -> anyhow::Result<Vec<String>> {
         let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let mut paths = Vec::new();
         let sqlite = base.join(".local/share/opencode/opencode.db");
         if sqlite.is_file() {
-            return Ok(vec![sqlite.to_string_lossy().to_string()]);
+            paths.push(sqlite.to_string_lossy().to_string());
         }
-
-        Ok(adapter_common::collect_files_with_ext(
+        paths.extend(adapter_common::collect_files_with_ext(
             &base.join(".local/share/opencode/storage/message"),
             "json",
-        ))
+        ));
+        Ok(paths)
     }
 
     fn scan_changes_since(
@@ -181,71 +182,83 @@ fn load_message_json(
     source_paths: &[String],
     cursor: Option<&str>,
 ) -> anyhow::Result<Vec<NativeRecord>> {
-    if let Some(db_path) = source_paths
+    let (db_paths, json_paths): (Vec<_>, Vec<_>) = source_paths
         .iter()
-        .find(|path| Path::new(path).extension().and_then(|ext| ext.to_str()) == Some("db"))
-    {
-        return load_message_sqlite(db_path, cursor);
+        .partition(|p| Path::new(p).extension().and_then(|ext| ext.to_str()) == Some("db"));
+
+    let mut out = Vec::new();
+    for db_path in &db_paths {
+        out.extend(load_message_sqlite(db_path, cursor)?);
+    }
+    if json_paths.is_empty() {
+        out.sort_by(|a, b| {
+            a.updated_at
+                .cmp(&b.updated_at)
+                .then_with(|| a.source_id.cmp(&b.source_id))
+        });
+        return Ok(out);
     }
 
     let parsed_cursor = cursor.and_then(adapter_common::parse_cursor);
     let session_meta_index = cached_session_meta_index();
 
-    let mut out: Vec<NativeRecord> = source_paths
-        .par_iter()
-        .filter_map(|path| {
-            let file_mtime = adapter_common::file_mtime(path);
-            if let Some(ref cur) = parsed_cursor
-                && let Some(mtime) = file_mtime
-                && mtime <= cur.ts
-            {
-                return None;
-            }
+    out.extend(
+        json_paths
+            .par_iter()
+            .filter_map(|path| {
+                let file_mtime = adapter_common::file_mtime(path);
+                if let Some(ref cur) = parsed_cursor
+                    && let Some(mtime) = file_mtime
+                    && mtime <= cur.ts
+                {
+                    return None;
+                }
 
-            let content = fs::read_to_string(path).ok()?;
-            let mut val: Value = serde_json::from_str(&content).ok()?;
-            let ts = extract_ts(&val).or(file_mtime).unwrap_or_else(Utc::now);
-            let source_id = val
-                .get("id")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| deterministic_id(&["opencode", "message", path]));
-            if let Some(ref cur) = parsed_cursor
-                && adapter_common::should_skip(ts, &source_id, cur)
-            {
-                return None;
-            }
+                let content = fs::read_to_string(path).ok()?;
+                let mut val: Value = serde_json::from_str(&content).ok()?;
+                let ts = extract_ts(&val).or(file_mtime).unwrap_or_else(Utc::now);
+                let source_id = val
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| deterministic_id(&["opencode", "message", path]));
+                if let Some(ref cur) = parsed_cursor
+                    && adapter_common::should_skip(ts, &source_id, cur)
+                {
+                    return None;
+                }
 
-            let content_text = extract_part_text(&source_id);
-            if content_text.is_empty() {
-                return None;
-            }
+                let content_text = extract_part_text(&source_id);
+                if content_text.is_empty() {
+                    return None;
+                }
 
-            let session_key = resolve_session_key_for_payload(
-                &val,
-                Some(path.as_str()),
-                &source_id,
-                session_meta_index,
-            );
-            let session_title = session_meta_index
-                .meta_for(&session_key)
-                .map(|meta| meta.title.clone())
-                .unwrap_or_else(|| session_key.clone());
+                let session_key = resolve_session_key_for_payload(
+                    &val,
+                    Some(path.as_str()),
+                    &source_id,
+                    session_meta_index,
+                );
+                let session_title = session_meta_index
+                    .meta_for(&session_key)
+                    .map(|meta| meta.title.clone())
+                    .unwrap_or_else(|| session_key.clone());
 
-            if let Some(obj) = val.as_object_mut() {
-                obj.insert("__source_path".to_string(), Value::String(path.clone()));
-                obj.insert("__content".to_string(), Value::String(content_text));
-                obj.insert("__session_key".to_string(), Value::String(session_key));
-                obj.insert("__session_title".to_string(), Value::String(session_title));
-            }
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert("__source_path".to_string(), Value::String(path.to_string()));
+                    obj.insert("__content".to_string(), Value::String(content_text));
+                    obj.insert("__session_key".to_string(), Value::String(session_key));
+                    obj.insert("__session_title".to_string(), Value::String(session_title));
+                }
 
-            Some(NativeRecord {
-                source_id,
-                updated_at: ts,
-                payload: val,
+                Some(NativeRecord {
+                    source_id,
+                    updated_at: ts,
+                    payload: val,
+                })
             })
-        })
-        .collect();
+            .collect::<Vec<_>>(),
+    );
 
     out.sort_by(|a, b| {
         a.updated_at
@@ -264,14 +277,20 @@ fn load_message_sqlite(db_path: &str, cursor: Option<&str>) -> anyhow::Result<Ve
     let connection = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
 
     let mut out = Vec::new();
+    let cursor_ms = parsed_cursor
+        .as_ref()
+        .map(|c| c.ts.timestamp_millis())
+        .unwrap_or(0);
+
     let mut message_stmt = connection.prepare(
         "SELECT m.id, m.session_id, m.time_created, m.time_updated, m.data, \
                 s.title, s.directory \
          FROM message m \
          JOIN session s ON s.id = m.session_id \
+         WHERE m.time_updated >= ?1 \
          ORDER BY m.time_updated ASC, m.id ASC",
     )?;
-    let message_rows = message_stmt.query_map([], |row| {
+    let message_rows = message_stmt.query_map([cursor_ms], |row| {
         let message_id: String = row.get(0)?;
         let session_id: String = row.get(1)?;
         let created_ms: i64 = row.get(2)?;
@@ -288,9 +307,11 @@ fn load_message_sqlite(db_path: &str, cursor: Option<&str>) -> anyhow::Result<Ve
     let mut part_stmt = connection.prepare(
         "SELECT p.message_id, p.id, p.data \
          FROM part p \
+         JOIN message m ON m.id = p.message_id \
+         WHERE m.time_updated >= ?1 \
          ORDER BY p.message_id ASC, p.time_created ASC, p.id ASC",
     )?;
-    let part_rows = part_stmt.query_map([], |row| {
+    let part_rows = part_stmt.query_map([cursor_ms], |row| {
         let message_id: String = row.get(0)?;
         let _part_id: String = row.get(1)?;
         let data_json: String = row.get(2)?;

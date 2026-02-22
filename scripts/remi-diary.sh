@@ -37,6 +37,39 @@ if [[ "${#summary_cmd[@]}" -eq 0 ]]; then
   echo "DIARY_SUMMARY_CMD must not be empty." >&2
   exit 1
 fi
+
+resolve_cli_path() {
+  local cmd="$1"
+  local resolved=""
+  local candidate=""
+
+  if resolved="$(command -v "$cmd" 2>/dev/null)"; then
+    printf '%s\n' "$resolved"
+    return 0
+  fi
+
+  candidate="$HOME/.local/bin/$cmd"
+  if [[ -x "$candidate" ]]; then
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+
+  for candidate in "$HOME"/.nvm/versions/node/*/bin/"$cmd"; do
+    [[ -x "$candidate" ]] || continue
+    resolved="$candidate"
+  done
+  if [[ -n "$resolved" ]]; then
+    printf '%s\n' "$resolved"
+    return 0
+  fi
+
+  return 1
+}
+
+if resolved_summary_bin="$(resolve_cli_path "${summary_cmd[0]}")"; then
+  summary_cmd[0]="$resolved_summary_bin"
+fi
+
 send_telegram="false"
 telegram_cmd_raw="${DIARY_TELEGRAM_CMD:-uvx telegram-send}"
 read -r -a telegram_cmd <<< "$telegram_cmd_raw"

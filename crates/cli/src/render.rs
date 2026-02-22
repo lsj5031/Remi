@@ -634,44 +634,59 @@ fn extract_diff_strings_from_jsonish(content: &str) -> Vec<String> {
 }
 
 fn decode_json_string_at(content: &str, start: usize) -> Option<(String, usize)> {
-    let bytes = content.as_bytes();
-    let mut i = start;
     let mut out = String::new();
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => {
-                i += 1;
-                if i >= bytes.len() {
-                    return None;
-                }
-                match bytes[i] {
-                    b'"' => out.push('"'),
-                    b'\\' => out.push('\\'),
-                    b'/' => out.push('/'),
-                    b'b' => out.push('\u{0008}'),
-                    b'f' => out.push('\u{000C}'),
-                    b'n' => out.push('\n'),
-                    b'r' => out.push('\r'),
-                    b't' => out.push('\t'),
-                    b'u' => {
-                        if i + 4 >= bytes.len() {
-                            return None;
+    let remaining = content.get(start..)?;
+    let mut chars = remaining.char_indices();
+    loop {
+        let (offset, ch) = chars.next()?;
+        match ch {
+            '\\' => {
+                let (_, esc) = chars.next()?;
+                match esc {
+                    '"' => out.push('"'),
+                    '\\' => out.push('\\'),
+                    '/' => out.push('/'),
+                    'b' => out.push('\u{0008}'),
+                    'f' => out.push('\u{000C}'),
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
+                    'u' => {
+                        let hex_start = start + chars.next()?.0;
+                        for _ in 0..3 {
+                            chars.next()?;
                         }
-                        let hex = std::str::from_utf8(&bytes[i + 1..i + 5]).ok()?;
-                        let codepoint = u16::from_str_radix(hex, 16).ok()?;
-                        let ch = char::from_u32(codepoint as u32)?;
-                        out.push(ch);
-                        i += 4;
+                        let hex = content.get(hex_start..hex_start + 4)?;
+                        let mut codepoint = u32::from(u16::from_str_radix(hex, 16).ok()?);
+                        if (0xD800..=0xDBFF).contains(&codepoint) {
+                            let (_, bs) = chars.next()?;
+                            let (_, u_ch) = chars.next()?;
+                            if bs == '\\' && u_ch == 'u' {
+                                let lo_start = start + chars.next()?.0;
+                                for _ in 0..3 {
+                                    chars.next()?;
+                                }
+                                let lo_hex = content.get(lo_start..lo_start + 4)?;
+                                let lo = u32::from(u16::from_str_radix(lo_hex, 16).ok()?);
+                                if (0xDC00..=0xDFFF).contains(&lo) {
+                                    codepoint =
+                                        0x10000 + ((codepoint - 0xD800) << 10) + (lo - 0xDC00);
+                                } else {
+                                    return None;
+                                }
+                            } else {
+                                return None;
+                            }
+                        }
+                        out.push(char::from_u32(codepoint)?);
                     }
-                    other => out.push(other as char),
+                    other => out.push(other),
                 }
             }
-            b'"' => return Some((out, i + 1)),
-            byte => out.push(byte as char),
+            '"' => return Some((out, start + offset + 1)),
+            _ => out.push(ch),
         }
-        i += 1;
     }
-    None
 }
 
 fn looks_like_unified_diff(content: &str) -> bool {
