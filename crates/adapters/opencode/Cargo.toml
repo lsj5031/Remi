@@ -11,4 +11,5 @@ adapter-common = { path = "../common" }
 core-model = { path = "../../core-model" }
 dirs.workspace = true
 rayon.workspace = true
+rusqlite.workspace = true
 serde_json.workspace = true

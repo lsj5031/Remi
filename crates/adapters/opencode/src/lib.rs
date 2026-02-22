@@ -10,6 +10,7 @@ use core_model::{
     AgentAdapter, AgentKind, ArchiveCapability, NativeRecord, NormalizedBatch, deterministic_id,
 };
 use rayon::prelude::*;
+use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 
 pub struct OpenCodeAdapter;
@@ -21,6 +22,11 @@ impl AgentAdapter for OpenCodeAdapter {
 
     fn discover_source_paths(&self) -> anyhow::Result<Vec<String>> {
         let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let sqlite = base.join(".local/share/opencode/opencode.db");
+        if sqlite.is_file() {
+            return Ok(vec![sqlite.to_string_lossy().to_string()]);
+        }
+
         Ok(adapter_common::collect_files_with_ext(
             &base.join(".local/share/opencode/storage/message"),
             "json",
@@ -175,6 +181,13 @@ fn load_message_json(
     source_paths: &[String],
     cursor: Option<&str>,
 ) -> anyhow::Result<Vec<NativeRecord>> {
+    if let Some(db_path) = source_paths
+        .iter()
+        .find(|path| Path::new(path).extension().and_then(|ext| ext.to_str()) == Some("db"))
+    {
+        return load_message_sqlite(db_path, cursor);
+    }
+
     let parsed_cursor = cursor.and_then(adapter_common::parse_cursor);
     let session_meta_index = cached_session_meta_index();
 
@@ -240,6 +253,197 @@ fn load_message_json(
             .then_with(|| a.source_id.cmp(&b.source_id))
     });
     Ok(out)
+}
+
+fn load_message_sqlite(db_path: &str, cursor: Option<&str>) -> anyhow::Result<Vec<NativeRecord>> {
+    if !Path::new(db_path).is_file() {
+        return Ok(Vec::new());
+    }
+
+    let parsed_cursor = cursor.and_then(adapter_common::parse_cursor);
+    let connection = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+
+    let mut out = Vec::new();
+    let mut message_stmt = connection.prepare(
+        "SELECT m.id, m.session_id, m.time_created, m.time_updated, m.data, \
+                s.title, s.directory \
+         FROM message m \
+         JOIN session s ON s.id = m.session_id \
+         ORDER BY m.time_updated ASC, m.id ASC",
+    )?;
+    let message_rows = message_stmt.query_map([], |row| {
+        let message_id: String = row.get(0)?;
+        let session_id: String = row.get(1)?;
+        let created_ms: i64 = row.get(2)?;
+        let updated_ms: i64 = row.get(3)?;
+        let data_json: String = row.get(4)?;
+        let title: String = row.get(5)?;
+        let directory: String = row.get(6)?;
+        Ok((
+            message_id, session_id, created_ms, updated_ms, data_json, title, directory,
+        ))
+    })?;
+
+    let mut content_by_message: HashMap<String, String> = HashMap::new();
+    let mut part_stmt = connection.prepare(
+        "SELECT p.message_id, p.id, p.data \
+         FROM part p \
+         ORDER BY p.message_id ASC, p.time_created ASC, p.id ASC",
+    )?;
+    let part_rows = part_stmt.query_map([], |row| {
+        let message_id: String = row.get(0)?;
+        let _part_id: String = row.get(1)?;
+        let data_json: String = row.get(2)?;
+        Ok((message_id, data_json))
+    })?;
+
+    for row in part_rows.flatten() {
+        let (message_id, data_json) = row;
+        let Ok(value): Result<Value, _> = serde_json::from_str(&data_json) else {
+            continue;
+        };
+        let Some(text) = extract_sqlite_part_text(&value) else {
+            continue;
+        };
+
+        let entry = content_by_message.entry(message_id).or_default();
+        if !entry.is_empty() {
+            entry.push('\n');
+        }
+        entry.push_str(&text);
+    }
+
+    for row in message_rows.flatten() {
+        let (message_id, session_id, created_ms, updated_ms, data_json, title, directory) = row;
+        let updated_at = Utc
+            .timestamp_millis_opt(updated_ms)
+            .single()
+            .or_else(|| Utc.timestamp_millis_opt(created_ms).single())
+            .unwrap_or_else(Utc::now);
+        if let Some(ref cur) = parsed_cursor
+            && adapter_common::should_skip(updated_at, &message_id, cur)
+        {
+            continue;
+        }
+
+        let mut payload = match serde_json::from_str::<Value>(&data_json) {
+            Ok(Value::Object(obj)) => Value::Object(obj),
+            _ => Value::Object(serde_json::Map::new()),
+        };
+
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("id".to_string(), Value::String(message_id.clone()));
+            obj.insert("sessionId".to_string(), Value::String(session_id.clone()));
+            obj.insert(
+                "timestamp".to_string(),
+                Value::Number(serde_json::Number::from(updated_ms)),
+            );
+            obj.insert(
+                "__source_path".to_string(),
+                Value::String(directory.clone()),
+            );
+            obj.insert(
+                "__content".to_string(),
+                Value::String(content_by_message.remove(&message_id).unwrap_or_default()),
+            );
+            obj.insert("__session_key".to_string(), Value::String(session_id));
+            obj.insert("__session_title".to_string(), Value::String(title));
+            obj.insert(
+                "__storage_db_path".to_string(),
+                Value::String(db_path.to_string()),
+            );
+        }
+
+        out.push(NativeRecord {
+            source_id: message_id,
+            updated_at,
+            payload,
+        });
+    }
+
+    out.sort_by(|a, b| {
+        a.updated_at
+            .cmp(&b.updated_at)
+            .then_with(|| a.source_id.cmp(&b.source_id))
+    });
+    Ok(out)
+}
+
+fn extract_sqlite_part_text(part: &Value) -> Option<String> {
+    if part.get("type").and_then(Value::as_str) == Some("tool") {
+        return extract_sqlite_tool_part_text(part);
+    }
+    let text = adapter_common::extract_content_text(Some(part));
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn extract_sqlite_tool_part_text(part: &Value) -> Option<String> {
+    let tool = part
+        .get("tool")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("tool");
+    let state = part.get("state")?;
+
+    let mut lines = Vec::new();
+    if let Some(input) = state.get("input").and_then(format_tool_payload) {
+        lines.push(format!("tool_use: {tool} {input}"));
+    } else {
+        lines.push(format!("tool_use: {tool}"));
+    }
+
+    match state.get("status").and_then(Value::as_str) {
+        Some("completed") => {
+            if let Some(output) = extract_tool_output_text(state) {
+                lines.push(format!("tool_result: {output}"));
+            }
+        }
+        Some("error") => {
+            if let Some(error) = state
+                .get("error")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                lines.push(format!("tool_result: {error}"));
+            }
+        }
+        _ => {}
+    }
+
+    Some(lines.join("\n"))
+}
+
+fn extract_tool_output_text(state: &Value) -> Option<String> {
+    if let Some(output) = state.get("output") {
+        let text = adapter_common::extract_content_text(Some(output));
+        if !text.trim().is_empty() {
+            return Some(text);
+        }
+        if let Some(fallback) = format_tool_payload(output) {
+            return Some(fallback);
+        }
+    }
+    None
+}
+
+fn format_tool_payload(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(s) => {
+            if s.trim().is_empty() {
+                None
+            } else {
+                Some(s.to_string())
+            }
+        }
+        _ => serde_json::to_string(value)
+            .ok()
+            .filter(|s| s != "null" && s != "{}" && s != "[]"),
+    }
 }
 
 fn extract_part_text(message_id: &str) -> String {
@@ -534,6 +738,92 @@ fn load_session_meta_index() -> SessionMetaIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn temp_db_path() -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("remi_opencode_test_{}_{}", std::process::id(), id));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir.join("opencode.db")
+    }
+
+    fn create_test_sqlite(db_path: &std::path::Path) {
+        let conn = Connection::open(db_path).expect("open sqlite");
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                parent_id TEXT,
+                slug TEXT NOT NULL,
+                directory TEXT NOT NULL,
+                title TEXT NOT NULL,
+                version TEXT NOT NULL,
+                share_url TEXT,
+                summary_additions INTEGER,
+                summary_deletions INTEGER,
+                summary_files INTEGER,
+                summary_diffs TEXT,
+                revert TEXT,
+                permission TEXT,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                time_compacting INTEGER,
+                time_archived INTEGER
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );",
+        )
+        .expect("create schema");
+
+        conn.execute(
+            "INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, share_url, summary_additions, summary_deletions, summary_files, summary_diffs, revert, permission, time_created, time_updated, time_compacting, time_archived)
+             VALUES (?1, 'project-1', NULL, 'slug', '/worktree', ?2, 'v2', NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?3, ?4, NULL, NULL)",
+            params!["session-1", "Session Title", 1_700_000_000_000_i64, 1_700_000_000_500_i64],
+        )
+        .expect("insert session");
+
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "msg-1",
+                "session-1",
+                1_700_000_000_100_i64,
+                1_700_000_000_200_i64,
+                r#"{"role":"assistant"}"#
+            ],
+        )
+        .expect("insert message");
+
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                "part-1",
+                "msg-1",
+                "session-1",
+                1_700_000_000_150_i64,
+                1_700_000_000_150_i64,
+                r#"{"type":"text","text":"hello from sqlite"}"#
+            ],
+        )
+        .expect("insert part");
+    }
 
     #[test]
     fn resolve_session_key_prefers_meta_aliases() {
@@ -642,5 +932,119 @@ mod tests {
         assert_eq!(batch.sessions.len(), 1);
         assert_eq!(batch.messages.len(), 2);
         assert_eq!(batch.sessions[0].source_ref, "canonical-session");
+    }
+
+    #[test]
+    fn load_message_sqlite_reads_messages_and_parts() {
+        let db_path = temp_db_path();
+        create_test_sqlite(&db_path);
+
+        let records = load_message_sqlite(&db_path.to_string_lossy(), None)
+            .expect("sqlite records should load");
+        assert_eq!(records.len(), 1);
+        let payload = &records[0].payload;
+        assert_eq!(records[0].source_id, "msg-1");
+        assert_eq!(
+            payload.get("role").and_then(Value::as_str),
+            Some("assistant")
+        );
+        assert_eq!(
+            payload.get("__session_key").and_then(Value::as_str),
+            Some("session-1")
+        );
+        assert_eq!(
+            payload.get("__session_title").and_then(Value::as_str),
+            Some("Session Title")
+        );
+        assert_eq!(
+            payload.get("__content").and_then(Value::as_str),
+            Some("hello from sqlite")
+        );
+    }
+
+    #[test]
+    fn load_message_json_dispatches_to_sqlite_when_db_path_present() {
+        let db_path = temp_db_path();
+        create_test_sqlite(&db_path);
+
+        let records = load_message_json(&[db_path.to_string_lossy().to_string()], None)
+            .expect("load_message_json should read sqlite");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source_id, "msg-1");
+    }
+
+    #[test]
+    fn load_message_sqlite_emits_tool_markers_from_tool_parts() {
+        let db_path = temp_db_path();
+        let conn = Connection::open(&db_path).expect("open sqlite");
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                project_id TEXT NOT NULL,
+                parent_id TEXT,
+                slug TEXT NOT NULL,
+                directory TEXT NOT NULL,
+                title TEXT NOT NULL,
+                version TEXT NOT NULL,
+                share_url TEXT,
+                summary_additions INTEGER,
+                summary_deletions INTEGER,
+                summary_files INTEGER,
+                summary_diffs TEXT,
+                revert TEXT,
+                permission TEXT,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                time_compacting INTEGER,
+                time_archived INTEGER
+            );
+            CREATE TABLE message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );
+            CREATE TABLE part (
+                id TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );",
+        )
+        .expect("create schema");
+
+        conn.execute(
+            "INSERT INTO session (id, project_id, parent_id, slug, directory, title, version, share_url, summary_additions, summary_deletions, summary_files, summary_diffs, revert, permission, time_created, time_updated, time_compacting, time_archived)
+             VALUES ('session-1', 'project-1', NULL, 'slug', '/worktree', 'Session Title', 'v2', NULL, NULL, NULL, NULL, NULL, NULL, NULL, 1700000000000, 1700000000500, NULL, NULL)",
+            [],
+        )
+        .expect("insert session");
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+             VALUES ('msg-tool', 'session-1', 1700000000100, 1700000000200, '{\"role\":\"assistant\"}')",
+            [],
+        )
+        .expect("insert message");
+        conn.execute(
+            "INSERT INTO part (id, message_id, session_id, time_created, time_updated, data)
+             VALUES ('part-tool', 'msg-tool', 'session-1', 1700000000150, 1700000000150, ?1)",
+            params![
+                r#"{"type":"tool","tool":"bash","state":{"status":"completed","input":{"command":"pwd"},"output":"/tmp"}}"#
+            ],
+        )
+        .expect("insert tool part");
+
+        let records = load_message_sqlite(&db_path.to_string_lossy(), None).expect("load sqlite");
+        assert_eq!(records.len(), 1);
+        let content = records[0]
+            .payload
+            .get("__content")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(content.contains("tool_use: bash {\"command\":\"pwd\"}"));
+        assert!(content.contains("tool_result: /tmp"));
     }
 }

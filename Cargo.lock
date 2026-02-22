@@ -1137,6 +1137,7 @@ dependencies = [
  "core-model",
  "dirs",
  "rayon",
+ "rusqlite",
  "serde_json",
 ]
 

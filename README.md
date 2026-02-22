@@ -125,7 +125,7 @@ Remi currently discovers and ingests from:
 |---|---|
 | Pi | `~/.pi/agent/sessions/**/*.jsonl`, `~/.pi/sessions/**/*.jsonl` |
 | Factory Droid | `~/.factory/sessions/**/*.jsonl`, `~/.local/share/factory-droid/sessions/**/*.jsonl` |
-| OpenCode | `~/.local/share/opencode/storage/message/**/*.json` (+ part text from `~/.local/share/opencode/storage/part/<message_id>/*.json`) |
+| OpenCode | `~/.local/share/opencode/opencode.db` (preferred) or legacy `~/.local/share/opencode/storage/message/**/*.json` (+ part text from `~/.local/share/opencode/storage/part/<message_id>/*.json`) |
 | Claude Code | `~/.claude/transcripts/**/*.jsonl`, `~/.claude/projects/**/*.jsonl`, `~/.local/share/claude-code/**/*.jsonl` |
 | Amp | `~/.local/share/amp/threads/**/*.json` |
 
