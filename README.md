@@ -515,7 +515,7 @@ scripts/markie-export.sh \
 
 `remi-diary.sh` prints a safety warning by default because it may send transcript data to external services:
 
-- your configured `pi` model provider (for summary generation)
+- your configured summary command/provider (default: `codex exec ...`) for summary generation
 - Telegram (when `--send` is enabled)
 
 If you intentionally want to suppress the warning:
