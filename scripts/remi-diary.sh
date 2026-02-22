@@ -14,13 +14,14 @@ Environment overrides:
   DIARY_DIR                 Output directory (default: ~/diary/remi)
   DIARY_MAX_SESSIONS        Max sessions to summarize (0 = all, default: 0)
   DIARY_MAX_CHARS           Max chars per session context (default: 12000)
-  DIARY_LLM_MODEL           pi model name (default: gemini-3-flash)
+  DIARY_LLM_MODEL           Optional model name passed to summary command via --model
+  DIARY_SUMMARY_CMD         Summary command (default: "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox")
   DIARY_TELEGRAM_CMD        Telegram send command (default: "uvx telegram-send")
   DIARY_SKIP_EXTERNAL_WARNING  Set to 1 to hide external-send warning
 
 Warning:
   This script may send transcript data to external services:
-  - pi model provider (summary generation)
+  - your configured summary command/provider (summary generation)
   - Telegram (when --send is enabled)
 USAGE
 }
@@ -29,7 +30,13 @@ date_arg=""
 sync_first="false"
 max_sessions="${DIARY_MAX_SESSIONS:-0}"
 max_chars="${DIARY_MAX_CHARS:-12000}"
-llm_model="${DIARY_LLM_MODEL:-gemini-3-flash}"
+llm_model="${DIARY_LLM_MODEL:-}"
+summary_cmd_raw="${DIARY_SUMMARY_CMD:-codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox}"
+read -r -a summary_cmd <<< "$summary_cmd_raw"
+if [[ "${#summary_cmd[@]}" -eq 0 ]]; then
+  echo "DIARY_SUMMARY_CMD must not be empty." >&2
+  exit 1
+fi
 send_telegram="false"
 telegram_cmd_raw="${DIARY_TELEGRAM_CMD:-uvx telegram-send}"
 read -r -a telegram_cmd <<< "$telegram_cmd_raw"
@@ -45,7 +52,7 @@ warn_external_send() {
   external_warning_shown="true"
   cat >&2 <<'WARN'
 Warning: this script may send transcript data to external services:
-- pi model provider (summary generation)
+- your configured summary command/provider (summary generation)
 - Telegram (when --send is enabled)
 Review/redact sensitive data before use.
 WARN
@@ -112,11 +119,6 @@ diary_dir="${DIARY_DIR:-$HOME/diary/remi}"
 
 if [[ ! -f "$remi_db" ]]; then
   echo "Database not found: $remi_db" >&2
-  exit 1
-fi
-
-if ! command -v pi >/dev/null 2>&1; then
-  echo "pi CLI not found in PATH. Please install pi to generate summaries." >&2
   exit 1
 fi
 
@@ -539,7 +541,29 @@ PROMPT
   cat "$session_context_file" >> "$prompt_file"
 
   warn_external_send
-  llm_summary="$(pi --model "$llm_model" --no-tools -p "$(cat "$prompt_file")")"
+  llm_error_file="$(mktemp)"
+  llm_summary_file="$(mktemp)"
+
+  if ! command -v "${summary_cmd[0]}" >/dev/null 2>&1; then
+    llm_summary_error="Summary CLI not found: ${summary_cmd[0]}"
+    echo "Warning: $llm_summary_error" >&2
+  else
+    llm_cmd=( "${summary_cmd[@]}" )
+    if [[ -n "$llm_model" ]]; then
+      llm_cmd+=(--model "$llm_model")
+    fi
+    llm_cmd+=(--output-last-message "$llm_summary_file")
+
+    if ! "${llm_cmd[@]}" < "$prompt_file" > /dev/null 2>"$llm_error_file"; then
+      llm_summary_error="$(tr '\n' ' ' < "$llm_error_file" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
+      llm_summary_error="${llm_summary_error:0:500}"
+      echo "Warning: failed to generate diary summary: ${llm_summary_error:-unknown error}" >&2
+    else
+      llm_summary="$(cat "$llm_summary_file")"
+    fi
+  fi
+
+  rm -f "$llm_error_file" "$llm_summary_file"
 fi
 
 output_path="$diary_dir/$target_date.md"
@@ -551,6 +575,12 @@ output_path="$diary_dir/$target_date.md"
   echo
   if [[ -n "$llm_summary" ]]; then
     echo "$llm_summary"
+  elif [[ -n "$sessions_tsv" ]]; then
+    echo "## Summary"
+    echo "- Sessions were found, but AI summary generation failed."
+    if [[ -n "$llm_summary_error" ]]; then
+      echo "- Error: $llm_summary_error"
+    fi
   else
     echo "## Summary"
     echo "- No sessions found for this date."
