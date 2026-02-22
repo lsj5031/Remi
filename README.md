@@ -4,7 +4,7 @@
 [![Release](https://img.shields.io/github/v/release/lsj5031/Remi?display_name=tag)](https://github.com/lsj5031/Remi/releases)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
-Unified coding-agent session memory for **Pi**, **Factory Droid**, **OpenCode**, **Claude Code**, and **Amp**.
+Unified coding-agent session memory for **Pi**, **Factory Droid**, **OpenCode**, **Claude Code**, **Amp**, and **Codex**.
 
 Tired of hunting through multiple agent transcript formats and folders? Remi gives you one searchable memory layer.
 
@@ -125,9 +125,10 @@ Remi currently discovers and ingests from:
 |---|---|
 | Pi | `~/.pi/agent/sessions/**/*.jsonl`, `~/.pi/sessions/**/*.jsonl` |
 | Factory Droid | `~/.factory/sessions/**/*.jsonl`, `~/.local/share/factory-droid/sessions/**/*.jsonl` |
-| OpenCode | `~/.local/share/opencode/opencode.db` (preferred) or legacy `~/.local/share/opencode/storage/message/**/*.json` (+ part text from `~/.local/share/opencode/storage/part/<message_id>/*.json`) |
+| OpenCode | `~/.local/share/opencode/opencode.db` (preferred) or legacy `~/.local/share/opencode/storage/message/**/*.json` (+ part text from `~/.local/share/opencode/storage/part/<message_id>/*.json`; session metadata from `~/.local/share/opencode/storage/session/**/*.json`) |
 | Claude Code | `~/.claude/transcripts/**/*.jsonl`, `~/.claude/projects/**/*.jsonl`, `~/.local/share/claude-code/**/*.jsonl` |
 | Amp | `~/.local/share/amp/threads/**/*.json` |
+| Codex | `~/.codex/sessions/**/*.jsonl` |
 
 ---
 
@@ -137,7 +138,7 @@ Top-level commands:
 
 ```text
 remi init
-remi sync --agent <pi|droid|opencode|claude|amp|all>
+remi sync --agent <pi|droid|opencode|claude|amp|codex|all>
 remi sessions <list|show>
 remi search query <QUERY> [options]
 remi archive <plan|run|restore>
@@ -168,6 +169,7 @@ remi sync --agent droid
 remi sync --agent opencode
 remi sync --agent claude
 remi sync --agent amp
+remi sync --agent codex
 remi sync --agent all
 ```
 
@@ -221,6 +223,8 @@ Options:
 - `--title <STRING>`
 - `--id <STRING>`
 - `--contains <STRING>`
+- `--raw-fts`
+- `--html-safety <strict|relaxed|trusted>` (default: `relaxed`)
 - `--output-dir <PATH>`
 
 #### Interactive mode (default)
@@ -534,7 +538,7 @@ Workspace crates:
 - `search`: lexical + recency (+ optional semantic) ranking
 - `archive`: plan/run/restore archive workflows
 - `adapter-common` (at `crates/adapters/common`): shared file/JSON parsing + cursor logic
-- `adapters/{pi,droid,opencode,claude,amp}`: per-agent ingestion adapters
+- `adapters/{pi,droid,opencode,claude,amp,codex}`: per-agent ingestion adapters
 - `embeddings` (optional): ONNX + tokenizer embedding generation
 - `cli`: `remi` command-line interface
 
