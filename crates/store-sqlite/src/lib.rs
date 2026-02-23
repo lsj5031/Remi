@@ -577,9 +577,9 @@ impl SqliteStore {
     }
 
     pub fn search_substring(&self, query: &str, limit: i64) -> anyhow::Result<Vec<SearchRow>> {
-        let pattern = format!("%{}%", query.to_lowercase());
+        let pattern = format!("%{}%", escape_like_pattern(query));
         let mut stmt = self.conn.prepare(
-            "SELECT m.id, m.session_id, m.content, m.ts FROM messages m WHERE lower(m.content) LIKE ?1 ORDER BY m.ts DESC LIMIT ?2",
+            "SELECT m.id, m.session_id, m.content, m.ts FROM messages m WHERE lower(m.content) LIKE ?1 ESCAPE '\\' ORDER BY m.ts DESC LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![pattern, limit], |r| {
             Ok(SearchRow {
@@ -704,6 +704,17 @@ fn parse_agent(s: &str) -> rusqlite::Result<core_model::AgentKind> {
             Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, err)),
         )
     })
+}
+
+fn escape_like_pattern(query: &str) -> String {
+    let mut escaped = String::with_capacity(query.len());
+    for ch in query.to_lowercase().chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 #[cfg(test)]
@@ -947,5 +958,29 @@ mod tests {
         assert_eq!(results.len(), 1);
         let empty = store.search_substring("nonexistent", 10).unwrap();
         assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn substring_search_escapes_like_wildcards() {
+        let mut store = SqliteStore::open(":memory:").unwrap();
+        store.init_schema().unwrap();
+        let with_underscore = make_batch(
+            core_model::AgentKind::Pi,
+            "s1",
+            "m1",
+            "hello_world function",
+        );
+        store.save_batch(&with_underscore).unwrap();
+        let with_x = make_batch(
+            core_model::AgentKind::Pi,
+            "s2",
+            "m2",
+            "helloxworld function",
+        );
+        store.save_batch(&with_x).unwrap();
+
+        let results = store.search_substring("hello_world", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].message_id, "m1");
     }
 }
