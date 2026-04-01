@@ -247,14 +247,19 @@ impl SqliteStore {
         );
         last = now;
         {
-            let mut stmt_delete =
-                tx.prepare_cached("DELETE FROM fts_messages WHERE message_id = ?1")?;
+            let mut seen_session_ids = std::collections::HashSet::new();
+            let mut stmt_delete_session =
+                tx.prepare_cached("DELETE FROM fts_messages WHERE session_id = ?1")?;
+            for m in &batch.messages {
+                if seen_session_ids.insert(&m.session_id) {
+                    stmt_delete_session.execute(params![m.session_id])?;
+                }
+            }
             let mut stmt_insert = tx.prepare_cached(
                 "INSERT INTO fts_messages (message_id, session_id, content, ts)
                 VALUES (?1, ?2, ?3, ?4)",
             )?;
             for m in &batch.messages {
-                stmt_delete.execute(params![m.id])?;
                 stmt_insert.execute(params![m.id, m.session_id, m.content, m.ts.to_rfc3339()])?;
             }
         }
@@ -996,5 +1001,110 @@ mod tests {
         let results = store.search_substring("hello_world", 10).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_id, "m1");
+    }
+
+    #[test]
+    fn fts_batch_delete_per_session_re_save() {
+        let mut store = SqliteStore::open(":memory:").unwrap();
+        store.init_schema().unwrap();
+
+        let mut batch = NormalizedBatch::default();
+        let now = Utc::now();
+        batch.sessions.push(Session {
+            id: "s1".to_string(),
+            agent: core_model::AgentKind::Pi,
+            source_ref: "ref".to_string(),
+            title: "test".to_string(),
+            created_at: now,
+            updated_at: now,
+        });
+        batch.messages.push(Message {
+            id: "m1".to_string(),
+            session_id: "s1".to_string(),
+            role: "user".to_string(),
+            content: "alpha beta".to_string(),
+            ts: now,
+        });
+        batch.messages.push(Message {
+            id: "m2".to_string(),
+            session_id: "s1".to_string(),
+            role: "assistant".to_string(),
+            content: "gamma delta".to_string(),
+            ts: now,
+        });
+        store.save_batch(&batch).unwrap();
+
+        let r = store.search_lexical("alpha", 10).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].message_id, "m1");
+        let r2 = store.search_lexical("gamma", 10).unwrap();
+        assert_eq!(r2.len(), 1);
+        assert_eq!(r2[0].message_id, "m2");
+
+        let mut batch2 = NormalizedBatch::default();
+        batch2.sessions.push(Session {
+            id: "s1".to_string(),
+            agent: core_model::AgentKind::Pi,
+            source_ref: "ref".to_string(),
+            title: "test".to_string(),
+            created_at: now,
+            updated_at: now,
+        });
+        batch2.messages.push(Message {
+            id: "m1".to_string(),
+            session_id: "s1".to_string(),
+            role: "user".to_string(),
+            content: "updated alpha content".to_string(),
+            ts: now,
+        });
+        batch2.messages.push(Message {
+            id: "m3".to_string(),
+            session_id: "s1".to_string(),
+            role: "assistant".to_string(),
+            content: "epsilon zeta".to_string(),
+            ts: now,
+        });
+        store.save_batch(&batch2).unwrap();
+
+        let r3 = store.search_lexical("updated", 10).unwrap();
+        assert_eq!(r3.len(), 1, "m1 FTS should reflect updated content");
+        let r4 = store.search_lexical("epsilon", 10).unwrap();
+        assert_eq!(r4.len(), 1, "new message m3 should be in FTS");
+        let r5 = store.search_lexical("gamma", 10).unwrap();
+        assert!(r5.is_empty(), "old m2 should be removed from FTS");
+    }
+
+    #[test]
+    fn fts_multi_session_batch() {
+        let mut store = SqliteStore::open(":memory:").unwrap();
+        store.init_schema().unwrap();
+        let now = Utc::now();
+        let mut batch = NormalizedBatch::default();
+        for i in 0..3 {
+            batch.sessions.push(Session {
+                id: format!("s{i}"),
+                agent: core_model::AgentKind::Pi,
+                source_ref: format!("ref{i}"),
+                title: format!("session {i}"),
+                created_at: now,
+                updated_at: now,
+            });
+            batch.messages.push(Message {
+                id: format!("m{i}"),
+                session_id: format!("s{i}"),
+                role: "user".to_string(),
+                content: format!("unique_keyword_{i}"),
+                ts: now,
+            });
+        }
+        store.save_batch(&batch).unwrap();
+
+        for i in 0..3 {
+            let r = store
+                .search_lexical(&format!("unique_keyword_{i}"), 10)
+                .unwrap();
+            assert_eq!(r.len(), 1, "session {i} message should be in FTS");
+            assert_eq!(r[0].session_id, format!("s{i}"));
+        }
     }
 }

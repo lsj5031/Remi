@@ -13,7 +13,7 @@ mod render;
 mod ui;
 
 #[derive(Parser)]
-#[command(name = "remi")]
+#[command(name = "remi", version)]
 #[command(about = "Unified coding-agent session memory")]
 struct Cli {
     #[command(subcommand)]
@@ -160,6 +160,17 @@ impl SearchFormat {
     }
 }
 
+fn sanitize_title(title: &str) -> String {
+    let first_line = title.split('\n').next().unwrap_or(title);
+    let char_count = first_line.chars().count();
+    if char_count > 80 {
+        let truncated: String = first_line.chars().take(80).collect();
+        format!("{truncated}…")
+    } else {
+        first_line.to_string()
+    }
+}
+
 fn command_name(cmd: &Commands) -> &'static str {
     match cmd {
         Commands::Init => "init",
@@ -300,11 +311,15 @@ fn main() -> anyhow::Result<()> {
                 let sessions = store.list_sessions()?;
                 info!(sessions = sessions.len(), "sessions listed");
                 for s in &sessions {
-                    println!("{} {} {}", s.id, s.agent.as_str(), s.title);
+                    println!("{} {} {}", s.id, s.agent.as_str(), sanitize_title(&s.title));
                 }
             }
             SessionsCommand::Show { session_id } => {
                 trace!(session_id, "showing session messages");
+                let session = store.get_session(&session_id)?;
+                if session.is_none() {
+                    return Err(anyhow::anyhow!("session not found: {session_id}"));
+                }
                 let msgs = store.get_session_messages(&session_id)?;
                 info!(messages = msgs.len(), "session messages listed");
                 for m in &msgs {
@@ -748,4 +763,47 @@ fn detect_model_path() -> Option<PathBuf> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_title_strips_newlines() {
+        assert_eq!(sanitize_title("hello\nworld"), "hello");
+    }
+
+    #[test]
+    fn sanitize_title_truncates_long() {
+        let long = "a".repeat(100);
+        let result = sanitize_title(&long);
+        assert_eq!(result.chars().count(), 81);
+        assert!(result.ends_with('…'));
+        assert!(result.starts_with(&"a".repeat(80)));
+    }
+
+    #[test]
+    fn sanitize_title_short_unchanged() {
+        assert_eq!(sanitize_title("short title"), "short title");
+    }
+
+    #[test]
+    fn sanitize_title_empty() {
+        assert_eq!(sanitize_title(""), "");
+    }
+
+    #[test]
+    fn sanitize_title_only_newlines() {
+        assert_eq!(sanitize_title("\n\n\n"), "");
+    }
+
+    #[test]
+    fn sanitize_title_long_first_line_with_newline() {
+        let input = format!("{}\nsecond line", "a".repeat(100));
+        let result = sanitize_title(&input);
+        assert_eq!(result.chars().count(), 81);
+        assert!(result.ends_with('…'));
+        assert!(!result.contains('\n'));
+    }
 }
