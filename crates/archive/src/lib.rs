@@ -4,6 +4,7 @@ use anyhow::Context;
 use chrono::Duration;
 use serde::{Deserialize, Serialize};
 use store_sqlite::SqliteStore;
+use tracing::{debug, instrument, trace};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArchiveManifest {
@@ -27,16 +28,22 @@ pub fn archive_plan(
     older_than: Duration,
     keep_latest: usize,
 ) -> anyhow::Result<String> {
+    debug!(
+        older_than_secs = older_than.num_seconds(),
+        keep_latest, "creating archive plan"
+    );
     let run = store.plan_archive(older_than, keep_latest)?;
     Ok(run.id)
 }
 
+#[instrument(skip(store), fields(run_id = %run_id))]
 pub fn archive_run(
     store: &SqliteStore,
     run_id: &str,
     execute: bool,
     delete_source: bool,
 ) -> anyhow::Result<String> {
+    debug!(run_id, execute, delete_source, "archive run starting");
     let items = store.archive_items_for_run(run_id)?;
     if !execute {
         return Ok(format!(
@@ -80,12 +87,19 @@ pub fn archive_run(
     }
 
     let payload = serde_json::to_vec_pretty(&bundle)?;
+    debug!(
+        size = payload.len(),
+        sessions = bundle.sessions.len(),
+        messages = bundle.messages.len(),
+        "archive bundle serialized"
+    );
     let checksum = blake3::hash(&payload).to_hex().to_string();
     let bundle_path = base.join("sessions.json");
     fs::write(&bundle_path, &payload)?;
 
     let reloaded = fs::read(&bundle_path).with_context(|| "verify bundle write")?;
     let verify = blake3::hash(&reloaded).to_hex().to_string();
+    trace!(checksum = %checksum, verify = %verify, "archive bundle verification");
     if verify != checksum {
         anyhow::bail!("archive verification failed; refusing deletion");
     }
@@ -103,6 +117,7 @@ pub fn archive_run(
     if delete_source {
         for item in &items {
             if item.planned_delete {
+                trace!(session_id = %item.session_id, "deleting archived session");
                 store.delete_session_cascade(&item.session_id)?;
             }
         }
@@ -112,7 +127,9 @@ pub fn archive_run(
     Ok(format!("executed: archived run {}", run_id))
 }
 
+#[instrument(skip(store), fields(bundle_path = %bundle_path))]
 pub fn archive_restore(store: &mut SqliteStore, bundle_path: &str) -> anyhow::Result<String> {
+    debug!(bundle_path, "restoring archive");
     let bytes = fs::read(bundle_path)?;
     let bundle: ArchiveBundle = serde_json::from_slice(&bytes)?;
     let batch = core_model::NormalizedBatch {

@@ -6,6 +6,7 @@ use core_model::{
 };
 use rayon::prelude::*;
 use serde_json::Value;
+use tracing::debug;
 
 pub struct DroidAdapter;
 
@@ -25,6 +26,7 @@ impl AgentAdapter for DroidAdapter {
             &base.join(".local/share/factory-droid/sessions"),
             "jsonl",
         ));
+        debug!(files = out.len(), "droid adapter discovered source paths");
         Ok(out)
     }
 
@@ -226,8 +228,8 @@ fn load_droid_jsonl(
                             .clone()
                             .or_else(|| {
                                 first_user_text.as_deref().map(|t| {
-                                    if t.len() > 80 {
-                                        format!("{}…", &t[..80])
+                                    if t.chars().count() > 80 {
+                                        format!("{}…", t.chars().take(80).collect::<String>())
                                     } else {
                                         t.to_string()
                                     }
@@ -270,11 +272,13 @@ fn load_droid_jsonl(
             .cmp(&b.updated_at)
             .then_with(|| a.source_id.cmp(&b.source_id))
     });
+    debug!(total = out.len(), "droid jsonl loaded");
     Ok(out)
 }
 
 fn normalize_records(records: &[NativeRecord]) -> NormalizedBatch {
     let kind = AgentKind::Droid;
+    debug!(records = records.len(), "normalizing droid records");
     let mut batch = NormalizedBatch::default();
     let mut sessions: std::collections::HashMap<String, core_model::Session> =
         std::collections::HashMap::new();
@@ -369,6 +373,11 @@ fn normalize_records(records: &[NativeRecord]) -> NormalizedBatch {
             .then_with(|| a.id.cmp(&b.id))
     });
     batch.sessions.extend(ordered_sessions);
+    debug!(
+        sessions = batch.sessions.len(),
+        messages = batch.messages.len(),
+        "droid records normalized"
+    );
     batch
 }
 

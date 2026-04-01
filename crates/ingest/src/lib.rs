@@ -1,6 +1,7 @@
 use chrono::Utc;
 use core_model::{AgentAdapter, Checkpoint};
 use store_sqlite::SqliteStore;
+use tracing::{debug, trace};
 
 #[derive(Debug, Clone)]
 pub enum SyncPhase {
@@ -20,12 +21,14 @@ pub fn sync_adapter(
     on_progress(SyncPhase::Discovering);
 
     let sources = adapter.discover_source_paths()?;
+    debug!(agent = %adapter.kind(), source_count = sources.len(), "discovered source paths");
 
     on_progress(SyncPhase::Scanning {
         file_count: sources.len(),
     });
 
     let checkpoint = store.get_checkpoint(adapter.kind().as_str())?;
+    trace!(agent = %adapter.kind(), checkpoint = ?checkpoint.as_deref(), "loaded checkpoint");
     let records = adapter.scan_changes_since(&sources, checkpoint.as_deref())?;
 
     on_progress(SyncPhase::Normalizing {
@@ -33,6 +36,7 @@ pub fn sync_adapter(
     });
 
     let batch = adapter.normalize(&records)?;
+    debug!(agent = %adapter.kind(), sessions = batch.sessions.len(), messages = batch.messages.len(), "normalized batch");
 
     on_progress(SyncPhase::Saving {
         message_count: batch.messages.len(),
@@ -42,16 +46,18 @@ pub fn sync_adapter(
 
     #[cfg(feature = "semantic")]
     if let Some(embedder) = embedder {
+        let mut embedded = 0usize;
         for msg in &batch.messages {
-            // Best effort embedding
             if let Ok(vec) = embedder.embed(&msg.content, false) {
-                // Ignore error on save (e.g. if too large or whatever, though save_embedding shouldn't fail easily)
                 let _ = store.save_embedding(&msg.id, &vec);
+                embedded += 1;
             }
         }
+        debug!(agent = %adapter.kind(), embedded, total = batch.messages.len(), "computed embeddings");
     }
 
     if let Some(cursor) = adapter.checkpoint_cursor(&records) {
+        trace!(agent = %adapter.kind(), cursor = %cursor, "saving checkpoint");
         store.upsert_checkpoint(&Checkpoint {
             agent: adapter.kind(),
             cursor,

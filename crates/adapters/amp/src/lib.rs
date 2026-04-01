@@ -7,6 +7,7 @@ use core_model::{
 };
 use rayon::prelude::*;
 use serde_json::Value;
+use tracing::debug;
 
 pub struct AmpAdapter;
 
@@ -17,10 +18,10 @@ impl AgentAdapter for AmpAdapter {
 
     fn discover_source_paths(&self) -> anyhow::Result<Vec<String>> {
         let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        Ok(adapter_common::collect_files_with_ext(
-            &base.join(".local/share/amp/threads"),
-            "json",
-        ))
+        let paths =
+            adapter_common::collect_files_with_ext(&base.join(".local/share/amp/threads"), "json");
+        debug!(files = paths.len(), "amp adapter discovered source paths");
+        Ok(paths)
     }
 
     fn scan_changes_since(
@@ -56,6 +57,7 @@ struct UsageLedgerIndex {
 }
 
 fn normalize_records(kind: AgentKind, records: &[NativeRecord]) -> NormalizedBatch {
+    debug!(kind = %kind, records = records.len(), "normalizing amp records");
     let mut batch = NormalizedBatch::default();
     let mut sessions: HashMap<String, SessionAccum> = HashMap::new();
     for rec in records {
@@ -142,6 +144,11 @@ fn normalize_records(kind: AgentKind, records: &[NativeRecord]) -> NormalizedBat
             .then_with(|| a.id.cmp(&b.id))
     });
     batch.sessions.extend(ordered_sessions);
+    debug!(
+        sessions = batch.sessions.len(),
+        messages = batch.messages.len(),
+        "amp records normalized"
+    );
     batch
 }
 
@@ -249,6 +256,7 @@ fn load_thread_json(
             .cmp(&b.updated_at)
             .then_with(|| a.source_id.cmp(&b.source_id))
     });
+    debug!(total = out.len(), "amp threads loaded");
     Ok(out)
 }
 

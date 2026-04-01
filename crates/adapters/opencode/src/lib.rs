@@ -12,6 +12,7 @@ use core_model::{
 use rayon::prelude::*;
 use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
+use tracing::debug;
 
 pub struct OpenCodeAdapter;
 
@@ -31,6 +32,11 @@ impl AgentAdapter for OpenCodeAdapter {
             &base.join(".local/share/opencode/storage/message"),
             "json",
         ));
+        debug!(
+            files = paths.len(),
+            has_sqlite = sqlite.is_file(),
+            "opencode adapter discovered source paths"
+        );
         Ok(paths)
     }
 
@@ -39,10 +45,12 @@ impl AgentAdapter for OpenCodeAdapter {
         source_paths: &[String],
         cursor: Option<&str>,
     ) -> anyhow::Result<Vec<NativeRecord>> {
+        debug!(files = source_paths.len(), cursor = ?cursor, "opencode scan starting");
         load_message_json(source_paths, cursor)
     }
 
     fn normalize(&self, records: &[NativeRecord]) -> anyhow::Result<NormalizedBatch> {
+        debug!(records = records.len(), "normalizing opencode records");
         Ok(normalize_records(
             AgentKind::OpenCode,
             records,
@@ -175,6 +183,11 @@ fn normalize_records(
             .then_with(|| a.id.cmp(&b.id))
     });
     batch.sessions.extend(ordered_sessions);
+    debug!(
+        sessions = batch.sessions.len(),
+        messages = batch.messages.len(),
+        "opencode records normalized"
+    );
     batch
 }
 
@@ -265,14 +278,17 @@ fn load_message_json(
             .cmp(&b.updated_at)
             .then_with(|| a.source_id.cmp(&b.source_id))
     });
+    debug!(total = out.len(), "opencode json loaded");
     Ok(out)
 }
 
 fn load_message_sqlite(db_path: &str, cursor: Option<&str>) -> anyhow::Result<Vec<NativeRecord>> {
     if !Path::new(db_path).is_file() {
+        debug!(db_path, "sqlite db not found, skipping");
         return Ok(Vec::new());
     }
 
+    debug!(db_path, cursor = ?cursor, "loading opencode sqlite messages");
     let parsed_cursor = cursor.and_then(adapter_common::parse_cursor);
     let connection = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
 

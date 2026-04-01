@@ -5,7 +5,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use ingest::SyncPhase;
 use render::HtmlSafety;
 use store_sqlite::SqliteStore;
-use tracing::info;
+use tracing::{debug, info, trace};
 
 #[cfg(feature = "semantic")]
 mod config;
@@ -160,9 +160,37 @@ impl SearchFormat {
     }
 }
 
+fn command_name(cmd: &Commands) -> &'static str {
+    match cmd {
+        Commands::Init => "init",
+        Commands::Sync(_) => "sync",
+        Commands::Sessions { .. } => "sessions",
+        Commands::Search { .. } => "search",
+        Commands::Archive { .. } => "archive",
+        #[cfg(feature = "semantic")]
+        Commands::Embed { .. } => "embed",
+        Commands::Doctor => "doctor",
+    }
+}
+
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
+    let fmt = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_target(true)
+        .with_writer(std::io::stderr);
+
+    if std::env::var("REMI_LOG_FORMAT").as_deref() == Ok("json") {
+        fmt.json()
+            .flatten_event(true)
+            .with_file(true)
+            .with_line_number(true)
+            .with_span_list(false)
+            .init();
+    } else {
+        fmt.init();
+    }
     let cli = Cli::parse();
+    debug!(command = %command_name(&cli.command), "cli args parsed");
     #[cfg(feature = "semantic")]
     let config = config::Config::load()?;
     let t = Instant::now();
@@ -276,6 +304,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             SessionsCommand::Show { session_id } => {
+                trace!(session_id, "showing session messages");
                 let msgs = store.get_session_messages(&session_id)?;
                 info!(messages = msgs.len(), "session messages listed");
                 for m in &msgs {
@@ -301,6 +330,7 @@ fn main() -> anyhow::Result<()> {
                 output_dir,
             } => {
                 info!(query = %query, "searching");
+                trace!(no_interactive, raw_fts, "search parameters");
                 #[cfg(feature = "semantic")]
                 let search_embedder = match semantic {
                     SemanticMode::Off => None,
@@ -322,6 +352,7 @@ fn main() -> anyhow::Result<()> {
                     #[cfg(feature = "semantic")]
                     Some(&mut semantic_cache),
                 )?;
+                debug!(hits = hits.len(), "search returned hits");
                 if hits.is_empty() {
                     info!(elapsed = ?t.elapsed(), "no results");
                     return Ok(());
@@ -338,6 +369,7 @@ fn main() -> anyhow::Result<()> {
                     id,
                     contains,
                 };
+                trace!(agent = ?filters.agent, title = ?filters.title, id = ?filters.id, contains = ?filters.contains, "applying filters");
                 sessions = ui::apply_filters(&sessions, &filters);
                 if sessions.is_empty() {
                     return Err(anyhow::anyhow!("no sessions matched filters"));
@@ -430,6 +462,7 @@ fn main() -> anyhow::Result<()> {
             } => {
                 let d = humantime::parse_duration(&older_than)
                     .with_context(|| "invalid --older-than")?;
+                debug!(older_than = %older_than, keep_latest, "archive plan parameters");
                 info!(older_than = %older_than, keep_latest, "planning archive");
                 let run_id =
                     archive::archive_plan(&store, chrono::Duration::from_std(d)?, keep_latest)?;
@@ -444,6 +477,10 @@ fn main() -> anyhow::Result<()> {
                 delete_source,
             } => {
                 let should_execute = execute && !dry_run;
+                debug!(
+                    execute,
+                    dry_run, delete_source, should_execute, "archive run flags"
+                );
                 if should_execute {
                     info!(run_id = %plan, "executing archive run");
                     if delete_source {

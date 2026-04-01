@@ -9,6 +9,7 @@ anyhow.workspace = true
 store-sqlite = { path = "../store-sqlite" }
 embeddings = { path = "../embeddings", optional = true }
 chrono.workspace = true
+tracing.workspace = true
 
 [features]
 semantic = ["dep:embeddings", "store-sqlite/semantic"]

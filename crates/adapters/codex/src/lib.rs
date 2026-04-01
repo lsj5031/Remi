@@ -6,6 +6,7 @@ use core_model::{
 };
 use rayon::prelude::*;
 use serde_json::Value;
+use tracing::debug;
 
 pub struct CodexAdapter;
 
@@ -16,10 +17,9 @@ impl AgentAdapter for CodexAdapter {
 
     fn discover_source_paths(&self) -> anyhow::Result<Vec<String>> {
         let base = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        Ok(adapter_common::collect_files_with_ext(
-            &base.join(".codex/sessions"),
-            "jsonl",
-        ))
+        let paths = adapter_common::collect_files_with_ext(&base.join(".codex/sessions"), "jsonl");
+        debug!(files = paths.len(), "codex adapter discovered source paths");
+        Ok(paths)
     }
 
     fn scan_changes_since(
@@ -159,8 +159,8 @@ fn load_rollout_jsonl(
                         let title = first_user_text
                             .as_deref()
                             .map(|t| {
-                                if t.len() > 80 {
-                                    format!("{}…", &t[..80])
+                                if t.chars().count() > 80 {
+                                    format!("{}…", t.chars().take(80).collect::<String>())
                                 } else {
                                     t.to_string()
                                 }
@@ -207,6 +207,7 @@ fn load_rollout_jsonl(
 
 fn normalize_records(records: &[NativeRecord]) -> NormalizedBatch {
     let kind = AgentKind::Codex;
+    debug!(records = records.len(), "normalizing codex records");
     let mut batch = NormalizedBatch::default();
     let mut sessions: std::collections::HashMap<String, core_model::Session> =
         std::collections::HashMap::new();
@@ -294,6 +295,11 @@ fn normalize_records(records: &[NativeRecord]) -> NormalizedBatch {
             .then_with(|| a.id.cmp(&b.id))
     });
     batch.sessions.extend(ordered_sessions);
+    debug!(
+        sessions = batch.sessions.len(),
+        messages = batch.messages.len(),
+        "codex records normalized"
+    );
     batch
 }
 

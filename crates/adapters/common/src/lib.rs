@@ -4,7 +4,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use core_model::{AgentKind, NativeRecord, NormalizedBatch, deterministic_id};
 use rayon::prelude::*;
 use serde_json::Value;
-use tracing::warn;
+use tracing::{debug, instrument, trace, warn};
 
 pub fn collect_files_with_ext(root: &Path, ext: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -25,6 +25,7 @@ pub fn collect_files_with_ext(root: &Path, ext: &str) -> Vec<String> {
         }
     }
     out.sort();
+    debug!(ext, count = out.len(), root = %root.display(), "collected files");
     out
 }
 
@@ -33,6 +34,7 @@ pub fn file_mtime(path: &str) -> Option<DateTime<Utc>> {
     Some(DateTime::<Utc>::from(modified))
 }
 
+#[instrument(skip(source_paths), fields(files = source_paths.len()))]
 pub fn load_jsonl(
     source_paths: &[String],
     cursor: Option<&str>,
@@ -95,6 +97,7 @@ pub fn load_jsonl(
             if skipped_lines > 0 {
                 warn!(path = %path, skipped_lines, "skipped malformed jsonl lines");
             }
+            trace!(path = %path, records = records.len(), "parsed jsonl file");
             records
         })
         .collect();
@@ -103,6 +106,11 @@ pub fn load_jsonl(
             .cmp(&b.updated_at)
             .then_with(|| a.source_id.cmp(&b.source_id))
     });
+    debug!(
+        total = out.len(),
+        cursor = cursor.is_some(),
+        "load_jsonl complete"
+    );
     Ok(out)
 }
 

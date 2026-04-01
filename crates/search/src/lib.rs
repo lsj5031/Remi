@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use chrono::{DateTime, Utc};
 
 use store_sqlite::SqliteStore;
+use tracing::debug;
 
 #[cfg(feature = "semantic")]
 use embeddings::Embedder;
@@ -67,12 +68,14 @@ pub fn search(
     } else {
         sanitize_fts_query(query)
     };
+    debug!(raw_query = %query, fts_query = %fts_query, raw_fts, "search query prepared");
 
     let bm25_rows = if !fts_query.is_empty() {
         store.search_lexical(&fts_query, 200)?
     } else {
         Vec::new()
     };
+    debug!(bm25_rows = bm25_rows.len(), "BM25 results");
 
     if bm25_rows.is_empty() {
         #[cfg(feature = "semantic")]
@@ -99,6 +102,7 @@ pub fn search(
     }
 
     let recency_rows = store.recent_messages(200)?;
+    debug!(recency_rows = recency_rows.len(), "recency rows loaded");
 
     #[cfg(feature = "semantic")]
     let semantic_rows = if let Some(embedder) = embedder {
@@ -186,6 +190,7 @@ pub fn search(
 
     out.sort_by(|a, b| b.score.total_cmp(&a.score));
     out.truncate(limit);
+    debug!(total = out.len(), "RRF scored results");
 
     Ok(out)
 }
@@ -238,6 +243,7 @@ pub fn search_sessions(
 
     out.sort_by(|a, b| b.score.total_cmp(&a.score));
     out.truncate(limit);
+    debug!(sessions = out.len(), "session hits grouped");
     Ok(out)
 }
 

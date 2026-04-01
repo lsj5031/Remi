@@ -10,6 +10,7 @@ chrono.workspace = true
 core-model = { path = "../core-model" }
 store-sqlite = { path = "../store-sqlite" }
 embeddings = { path = "../embeddings", optional = true }
+tracing.workspace = true
 
 [features]
 semantic = ["dep:embeddings", "store-sqlite/semantic"]

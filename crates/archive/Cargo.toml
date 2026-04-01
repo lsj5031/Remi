@@ -13,3 +13,4 @@ dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 store-sqlite = { path = "../store-sqlite" }
+tracing.workspace = true

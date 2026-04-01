@@ -8,7 +8,7 @@ use core_model::{
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use std::time::Instant;
-use tracing::info;
+use tracing::{debug, info, trace};
 
 pub struct SqliteStore {
     conn: Connection,
@@ -42,6 +42,7 @@ impl SqliteStore {
     }
 
     pub fn open(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        debug!(path = %path.as_ref().display(), "opening sqlite connection");
         let conn = Connection::open(path.as_ref())
             .with_context(|| format!("opening sqlite db {}", path.as_ref().display()))?;
         conn.execute_batch(
@@ -55,6 +56,7 @@ impl SqliteStore {
         let version: i64 = self
             .conn
             .query_row("PRAGMA user_version;", [], |r| r.get(0))?;
+        trace!(version, "schema version check");
         if version < 1 {
             self.conn.execute_batch(
                 r#"
@@ -339,6 +341,12 @@ impl SqliteStore {
             total = ?started.elapsed(),
             "commit done"
         );
+        debug!(
+            sessions = batch.sessions.len(),
+            messages = batch.messages.len(),
+            provenance = batch.provenance.len(),
+            "save_batch complete"
+        );
         Ok(())
     }
 
@@ -385,17 +393,20 @@ impl SqliteStore {
     }
 
     pub fn get_checkpoint(&self, agent: &str) -> anyhow::Result<Option<String>> {
-        self.conn
+        let result: Option<String> = self
+            .conn
             .query_row(
                 "SELECT cursor FROM checkpoints WHERE agent = ?1",
                 params![agent],
                 |r| r.get(0),
             )
-            .optional()
-            .map_err(Into::into)
+            .optional()?;
+        debug!(agent, cursor = ?result.as_deref(), "checkpoint loaded");
+        Ok(result)
     }
 
     pub fn upsert_checkpoint(&self, checkpoint: &Checkpoint) -> anyhow::Result<()> {
+        trace!(agent = %checkpoint.agent, cursor = %checkpoint.cursor, "upserting checkpoint");
         self.conn.execute(
             r#"INSERT INTO checkpoints (agent, cursor, updated_at) VALUES (?1, ?2, ?3)
             ON CONFLICT(agent) DO UPDATE SET cursor=excluded.cursor, updated_at=excluded.updated_at"#,
@@ -542,6 +553,7 @@ impl SqliteStore {
     }
 
     pub fn search_lexical(&self, query: &str, limit: i64) -> anyhow::Result<Vec<SearchRow>> {
+        debug!(query, limit, "lexical search");
         let mut stmt = self.conn.prepare(
             "SELECT message_id, session_id, content, ts, bm25(fts_messages) AS rank FROM fts_messages WHERE fts_messages MATCH ?1 ORDER BY rank LIMIT ?2",
         )?;
@@ -577,7 +589,8 @@ impl SqliteStore {
     }
 
     pub fn search_substring(&self, query: &str, limit: i64) -> anyhow::Result<Vec<SearchRow>> {
-        let pattern = format!("%{}%", escape_like_pattern(query));
+        debug!(query, limit, "substring search");
+        let pattern = format!("%{}%", escape_like_pattern(&query.to_lowercase()));
         let mut stmt = self.conn.prepare(
             "SELECT m.id, m.session_id, m.content, m.ts FROM messages m WHERE lower(m.content) LIKE ?1 ESCAPE '\\' ORDER BY m.ts DESC LIMIT ?2",
         )?;
@@ -674,6 +687,7 @@ impl SqliteStore {
     }
 
     pub fn delete_session_cascade(&self, session_id: &str) -> anyhow::Result<()> {
+        debug!(session_id, "cascading delete session");
         self.conn
             .execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
         self.conn.execute(

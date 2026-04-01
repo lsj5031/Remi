@@ -6,6 +6,7 @@ use core_model::{
 };
 use rayon::prelude::*;
 use serde_json::Value;
+use tracing::debug;
 
 pub struct PiAdapter;
 
@@ -25,6 +26,7 @@ impl AgentAdapter for PiAdapter {
             &base.join(".pi/sessions"),
             "jsonl",
         ));
+        debug!(files = out.len(), "pi adapter discovered source paths");
         Ok(out)
     }
 
@@ -184,8 +186,8 @@ fn load_pi_jsonl(
                         let title = first_user_text
                             .as_deref()
                             .map(|t| {
-                                if t.len() > 80 {
-                                    format!("{}…", &t[..80])
+                                if t.chars().count() > 80 {
+                                    format!("{}…", t.chars().take(80).collect::<String>())
                                 } else {
                                     t.to_string()
                                 }
@@ -228,11 +230,13 @@ fn load_pi_jsonl(
             .cmp(&b.updated_at)
             .then_with(|| a.source_id.cmp(&b.source_id))
     });
+    debug!(total = out.len(), "pi jsonl loaded");
     Ok(out)
 }
 
 fn normalize_records(records: &[NativeRecord]) -> NormalizedBatch {
     let kind = AgentKind::Pi;
+    debug!(records = records.len(), "normalizing pi records");
     let mut batch = NormalizedBatch::default();
     let mut sessions: std::collections::HashMap<String, core_model::Session> =
         std::collections::HashMap::new();
@@ -320,6 +324,11 @@ fn normalize_records(records: &[NativeRecord]) -> NormalizedBatch {
             .then_with(|| a.id.cmp(&b.id))
     });
     batch.sessions.extend(ordered_sessions);
+    debug!(
+        sessions = batch.sessions.len(),
+        messages = batch.messages.len(),
+        "pi records normalized"
+    );
     batch
 }
 

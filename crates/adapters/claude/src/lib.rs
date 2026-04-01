@@ -5,6 +5,7 @@ use core_model::{
 };
 use rayon::prelude::*;
 use serde_json::Value;
+use tracing::debug;
 
 pub struct ClaudeAdapter;
 
@@ -28,6 +29,7 @@ impl AgentAdapter for ClaudeAdapter {
             &base.join(".local/share/claude-code"),
             "jsonl",
         ));
+        debug!(files = out.len(), "claude adapter discovered source paths");
         Ok(out)
     }
 
@@ -134,10 +136,12 @@ impl AgentAdapter for ClaudeAdapter {
                 .cmp(&b.updated_at)
                 .then_with(|| a.source_id.cmp(&b.source_id))
         });
+        debug!(total = out.len(), "claude scan complete");
         Ok(out)
     }
 
     fn normalize(&self, records: &[NativeRecord]) -> anyhow::Result<NormalizedBatch> {
+        debug!(records = records.len(), "normalizing claude records");
         normalize_records(AgentKind::Claude, records)
     }
 
@@ -400,6 +404,11 @@ fn normalize_records(kind: AgentKind, records: &[NativeRecord]) -> anyhow::Resul
             .then_with(|| a.id.cmp(&b.id))
     });
     batch.sessions.extend(ordered_sessions);
+    debug!(
+        sessions = batch.sessions.len(),
+        messages = batch.messages.len(),
+        "claude records normalized"
+    );
     Ok(batch)
 }
 
