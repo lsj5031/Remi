@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adapter-common"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "amp"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "adapter-common",
  "anyhow",
@@ -118,7 +118,7 @@ checksum = "5f0e0fee31ef5ed1ba1316088939cea399010ed7731dba877ed44aeb407a75ea"
 
 [[package]]
 name = "archive"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -339,7 +339,7 @@ checksum = "c3e64b0cc0439b12df2fa678eae89a1c56a529fd067a9115f7827f1fffd22b32"
 
 [[package]]
 name = "claude"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "adapter-common",
  "anyhow",
@@ -353,7 +353,7 @@ dependencies = [
 
 [[package]]
 name = "cli"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "amp",
  "anyhow",
@@ -385,7 +385,7 @@ dependencies = [
 
 [[package]]
 name = "codex"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "adapter-common",
  "anyhow",
@@ -442,7 +442,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "core-model"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "blake3",
@@ -593,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "droid"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "adapter-common",
  "anyhow",
@@ -836,7 +836,7 @@ dependencies = [
 
 [[package]]
 name = "ingest"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1144,7 +1144,7 @@ dependencies = [
 
 [[package]]
 name = "opencode"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "adapter-common",
  "anyhow",
@@ -1261,7 +1261,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pi"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "adapter-common",
  "anyhow",
@@ -1518,7 +1518,7 @@ dependencies = [
 
 [[package]]
 name = "search"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1655,7 +1655,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "store-sqlite"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "chrono",

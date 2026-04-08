@@ -500,6 +500,9 @@ Example diary usage:
 # Generate today's diary markdown
 scripts/remi-diary.sh --date today
 
+# Generate today's diary with structured progress events
+DIARY_PROGRESS_JSONL=/tmp/remi-diary.progress.jsonl scripts/remi-diary.sh --date today --sync
+
 # Generate and send yesterday's diary image to Telegram
 scripts/remi-diary.sh --date yesterday --send
 ```
@@ -523,6 +526,8 @@ If you intentionally want to suppress the warning:
 ```bash
 DIARY_SKIP_EXTERNAL_WARNING=1 scripts/remi-diary.sh --date today
 ```
+
+If you want machine-readable progress for timers or other automation, set `DIARY_PROGRESS_JSONL` or pass `--progress-jsonl <path>`; the script will append one JSON object per phase transition, including per-agent sync events.
 
 Use `DIARY_*` environment overrides (shown in `scripts/remi-diary.sh --help`) to adapt paths/commands for your environment.
 

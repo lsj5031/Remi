@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-04-08
+
+### Added
+
+- JSONL progress reporting for `scripts/remi-diary.sh`, including per-agent sync events for easier timer diagnostics.
+
+### Changed
+
+- `remi-diary` now prefers the installed `remi` binary before falling back to a bundled copy.
+
+### Fixed
+
+- Claude sync performance by replacing session-wide FTS rebuilds with rowid-targeted updates for touched messages only.
+- Nightly diary generation now completes reliably against current Claude/Codex backlogs instead of appearing stuck during sync.
+
 ## [0.1.0] - 2026-04-01
 
 ### Added

@@ -5,11 +5,12 @@ usage() {
   cat <<'USAGE'
 Usage: remi-diary.sh [--date YYYY-MM-DD] [--yesterday] [--sync] [--send]
                      [--max-sessions N] [--max-chars N] [--model MODEL]
+                     [--progress-jsonl PATH]
 
 Generates a daily markdown log from Remi's SQLite database.
 
 Environment overrides:
-  REMI_BIN                  Path to remi binary (default: remi or repo bundled binary)
+  REMI_BIN                  Path to remi binary (default: PATH remi, then repo bundled binary)
   REMI_DB                   Path to remi.db (default: ~/.local/share/remi/remi.db)
   DIARY_DIR                 Output directory (default: ~/diary/remi)
   DIARY_MAX_SESSIONS        Max sessions to summarize (0 = all, default: 0)
@@ -17,6 +18,7 @@ Environment overrides:
   DIARY_LLM_MODEL           Optional model name passed to summary command via --model
   DIARY_SUMMARY_CMD         Summary command (default: "codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox")
   DIARY_TELEGRAM_CMD        Telegram send command (default: "uvx telegram-send")
+  DIARY_PROGRESS_JSONL      Optional JSONL file to append structured progress events
   DIARY_SKIP_EXTERNAL_WARNING  Set to 1 to hide external-send warning
 
 Warning:
@@ -31,6 +33,8 @@ sync_first="false"
 max_sessions="${DIARY_MAX_SESSIONS:-0}"
 max_chars="${DIARY_MAX_CHARS:-12000}"
 llm_model="${DIARY_LLM_MODEL:-}"
+progress_jsonl_path="${DIARY_PROGRESS_JSONL:-}"
+run_id="$(date +%s)-$$"
 summary_cmd_raw="${DIARY_SUMMARY_CMD:-codex exec --skip-git-repo-check --dangerously-bypass-approvals-and-sandbox}"
 read -r -a summary_cmd <<< "$summary_cmd_raw"
 if [[ "${#summary_cmd[@]}" -eq 0 ]]; then
@@ -91,6 +95,39 @@ Review/redact sensitive data before use.
 WARN
 }
 
+emit_progress() {
+  local phase="$1"
+  local status="$2"
+  shift 2
+
+  [[ -n "$progress_jsonl_path" ]] || return 0
+
+  python - "$progress_jsonl_path" "$run_id" "$phase" "$status" "$target_date" "$$" "$@" <<'PY'
+from datetime import datetime, timezone
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+event = {
+    "ts": datetime.now(timezone.utc).isoformat(),
+    "run_id": sys.argv[2],
+    "phase": sys.argv[3],
+    "status": sys.argv[4],
+    "target_date": sys.argv[5],
+    "pid": int(sys.argv[6]),
+}
+rest = sys.argv[7:]
+if len(rest) % 2 != 0:
+    raise SystemExit("emit_progress expects key/value pairs")
+for idx in range(0, len(rest), 2):
+    event[rest[idx]] = rest[idx + 1]
+path.parent.mkdir(parents=True, exist_ok=True)
+with path.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+PY
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --date)
@@ -121,6 +158,10 @@ while [[ $# -gt 0 ]]; do
       llm_model="$2"
       shift 2
       ;;
+    --progress-jsonl)
+      progress_jsonl_path="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -140,13 +181,20 @@ fi
 target_date="$(date -d "$date_arg" +%F)"
 generated_at="$(date +"%F %H:%M")"
 
-default_bin="remi"
 repo_bin="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/dist/bundled/bin/remi"
-if [[ -x "$repo_bin" ]]; then
-  default_bin="$repo_bin"
+remi_bin_source="env"
+if [[ -n "${REMI_BIN:-}" ]]; then
+  remi_bin="$REMI_BIN"
+elif resolved_remi_bin="$(resolve_cli_path "remi")"; then
+  remi_bin="$resolved_remi_bin"
+  remi_bin_source="path"
+elif [[ -x "$repo_bin" ]]; then
+  remi_bin="$repo_bin"
+  remi_bin_source="bundled"
+else
+  remi_bin="remi"
+  remi_bin_source="fallback"
 fi
-
-remi_bin="${REMI_BIN:-$default_bin}"
 remi_db="${REMI_DB:-$HOME/.local/share/remi/remi.db}"
 diary_dir="${DIARY_DIR:-$HOME/diary/remi}"
 
@@ -160,16 +208,47 @@ if [[ "$send_telegram" == "true" ]] && ! command -v "${telegram_cmd[0]}" >/dev/n
   exit 1
 fi
 
+sync_agents=(pi droid opencode claude amp codex)
+
 mkdir -p "$diary_dir"
 
+emit_progress "start" "started" \
+  "sync_requested" "$sync_first" \
+  "send_requested" "$send_telegram" \
+  "remi_bin" "$remi_bin" \
+  "remi_bin_source" "$remi_bin_source" \
+  "remi_db" "$remi_db" \
+  "diary_dir" "$diary_dir"
+
 if [[ "$sync_first" == "true" ]]; then
-  "$remi_bin" sync --agent all >/dev/null
+  emit_progress "sync" "started" "agent_count" "${#sync_agents[@]}"
+  for agent in "${sync_agents[@]}"; do
+    emit_progress "sync-agent" "started" \
+      "agent" "$agent" \
+      "command" "$remi_bin sync --agent $agent"
+    if "$remi_bin" sync --agent "$agent" >/dev/null; then
+      emit_progress "sync-agent" "completed" \
+        "agent" "$agent" \
+        "command" "$remi_bin sync --agent $agent"
+    else
+      rc=$?
+      emit_progress "sync-agent" "failed" \
+        "agent" "$agent" \
+        "command" "$remi_bin sync --agent $agent" \
+        "exit_code" "$rc"
+      emit_progress "sync" "failed" "agent" "$agent" "exit_code" "$rc"
+      exit "$rc"
+    fi
+  done
+  emit_progress "sync" "completed" "agent_count" "${#sync_agents[@]}"
 fi
 
 limit_clause=""
 if [[ "$max_sessions" =~ ^[0-9]+$ ]] && [[ "$max_sessions" -gt 0 ]]; then
   limit_clause="limit $max_sessions"
 fi
+
+emit_progress "query" "started" "max_sessions" "$max_sessions" "max_chars" "$max_chars"
 
 sessions_tsv="$(sqlite3 -separator $'\t' "$remi_db" "
   select
@@ -203,6 +282,10 @@ if [[ -n "$summary_row" ]]; then
   messages_count="${summary_row##*$'\t'}"
 fi
 
+emit_progress "query" "completed" \
+  "sessions_count" "$sessions_count" \
+  "messages_count" "$messages_count"
+
 agents_row="$(sqlite3 -separator $'\t' "$remi_db" "
   select s.agent, count(distinct s.id)
   from sessions s
@@ -216,6 +299,8 @@ llm_summary=""
 session_context_file=""
 prompt_file=""
 if [[ -n "$sessions_tsv" ]]; then
+  emit_progress "summary" "started" "sessions_count" "$sessions_count"
+
   project_from_path() {
     local path="$1"
     local tag=""
@@ -580,6 +665,7 @@ PROMPT
   if ! command -v "${summary_cmd[0]}" >/dev/null 2>&1; then
     llm_summary_error="Summary CLI not found: ${summary_cmd[0]}"
     echo "Warning: $llm_summary_error" >&2
+    emit_progress "summary" "failed" "reason" "$llm_summary_error"
   else
     llm_cmd=( "${summary_cmd[@]}" )
     if [[ -n "$llm_model" ]]; then
@@ -591,12 +677,16 @@ PROMPT
       llm_summary_error="$(tr '\n' ' ' < "$llm_error_file" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')"
       llm_summary_error="${llm_summary_error:0:500}"
       echo "Warning: failed to generate diary summary: ${llm_summary_error:-unknown error}" >&2
+      emit_progress "summary" "failed" "reason" "${llm_summary_error:-unknown error}"
     else
       llm_summary="$(cat "$llm_summary_file")"
+      emit_progress "summary" "completed" "summary_chars" "${#llm_summary}"
     fi
   fi
 
   rm -f "$llm_error_file" "$llm_summary_file"
+else
+  emit_progress "summary" "skipped" "reason" "no_sessions"
 fi
 
 output_path="$diary_dir/$target_date.md"
@@ -639,19 +729,31 @@ output_path="$diary_dir/$target_date.md"
   fi
 } > "$output_path"
 
+emit_progress "output" "completed" \
+  "output_path" "$output_path" \
+  "sessions_count" "$sessions_count" \
+  "messages_count" "$messages_count"
+
 echo "$output_path"
 
 if [[ "$send_telegram" == "true" ]]; then
   if [[ "$sessions_count" -eq 0 || "$messages_count" -eq 0 ]]; then
+    emit_progress "telegram" "skipped" "reason" "no_sessions"
+    emit_progress "complete" "completed" "output_path" "$output_path"
     exit 0
   fi
   markie_export="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/markie-export.sh"
   if [[ ! -x "$markie_export" ]]; then
+    emit_progress "telegram" "failed" "reason" "markie export script not found"
     echo "Markie export script not found: $markie_export" >&2
     exit 1
   fi
   warn_external_send
   svg_path="$diary_dir/$target_date.svg"
+  emit_progress "telegram" "started" "svg_path" "$svg_path"
   "$markie_export" --input "$output_path" --output "$svg_path" --format svg
   "${telegram_cmd[@]}" --file "$svg_path"
+  emit_progress "telegram" "completed" "svg_path" "$svg_path"
 fi
+
+emit_progress "complete" "completed" "output_path" "$output_path"

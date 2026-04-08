@@ -247,20 +247,27 @@ impl SqliteStore {
         );
         last = now;
         {
-            let mut seen_session_ids = std::collections::HashSet::new();
-            let mut stmt_delete_session =
-                tx.prepare_cached("DELETE FROM fts_messages WHERE session_id = ?1")?;
-            for m in &batch.messages {
-                if seen_session_ids.insert(&m.session_id) {
-                    stmt_delete_session.execute(params![m.session_id])?;
-                }
-            }
+            let mut seen_message_ids = std::collections::HashSet::new();
+            let mut stmt_lookup_rowid =
+                tx.prepare_cached("SELECT rowid FROM messages WHERE id = ?1")?;
+            let mut stmt_delete_message =
+                tx.prepare_cached("DELETE FROM fts_messages WHERE rowid = ?1")?;
             let mut stmt_insert = tx.prepare_cached(
-                "INSERT INTO fts_messages (message_id, session_id, content, ts)
-                VALUES (?1, ?2, ?3, ?4)",
+                "INSERT INTO fts_messages (rowid, message_id, session_id, content, ts)
+                VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
             for m in &batch.messages {
-                stmt_insert.execute(params![m.id, m.session_id, m.content, m.ts.to_rfc3339()])?;
+                if seen_message_ids.insert(&m.id) {
+                    let rowid: i64 = stmt_lookup_rowid.query_row(params![m.id], |r| r.get(0))?;
+                    stmt_delete_message.execute(params![rowid])?;
+                    stmt_insert.execute(params![
+                        rowid,
+                        m.id,
+                        m.session_id,
+                        m.content,
+                        m.ts.to_rfc3339()
+                    ])?;
+                }
             }
         }
         let now = Instant::now();
@@ -1004,7 +1011,7 @@ mod tests {
     }
 
     #[test]
-    fn fts_batch_delete_per_session_re_save() {
+    fn fts_batch_replaces_only_touched_messages() {
         let mut store = SqliteStore::open(":memory:").unwrap();
         store.init_schema().unwrap();
 
@@ -1071,7 +1078,8 @@ mod tests {
         let r4 = store.search_lexical("epsilon", 10).unwrap();
         assert_eq!(r4.len(), 1, "new message m3 should be in FTS");
         let r5 = store.search_lexical("gamma", 10).unwrap();
-        assert!(r5.is_empty(), "old m2 should be removed from FTS");
+        assert_eq!(r5.len(), 1, "untouched m2 should remain in FTS");
+        assert_eq!(r5[0].message_id, "m2");
     }
 
     #[test]
