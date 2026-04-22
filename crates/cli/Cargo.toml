@@ -12,6 +12,7 @@ path = "src/main.rs"
 askama = "0.12"
 anyhow.workspace = true
 archive = { path = "../archive" }
+blake3.workspace = true
 chrono.workspace = true
 clap.workspace = true
 claude = { path = "../adapters/claude" }
@@ -33,6 +34,7 @@ embeddings = { path = "../embeddings", optional = true }
 owo-colors = "4"
 fuzzy-matcher = "0.3"
 pulldown-cmark = { version = "0.12", default-features = false, features = ["html"] }
+rusqlite.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
