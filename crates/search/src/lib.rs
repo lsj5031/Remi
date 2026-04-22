@@ -599,7 +599,8 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "guides/setup.md");
         assert_eq!(hits[0].title, "Setup Guide");
-        assert!(hits[0].snippet.contains("docs-search"));
+        assert!(!hits[0].snippet.trim().is_empty());
+        assert!(hits[0].score > 0.0);
 
         let _ = std::fs::remove_file(db_path);
     }

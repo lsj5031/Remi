@@ -2,7 +2,7 @@ use std::{
     cell::RefCell,
     fs,
     path::{Path, PathBuf},
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Instant, UNIX_EPOCH},
 };
 
 use anyhow::{Context, bail};
@@ -645,6 +645,10 @@ struct ScannedDoc {
 }
 
 fn index_docs_root(root: &Path) -> anyhow::Result<DocsIndexSummary> {
+    index_docs_root_with_db(root, &default_db_path())
+}
+
+fn index_docs_root_with_db(root: &Path, db_path: &Path) -> anyhow::Result<DocsIndexSummary> {
     let canonical_root = root
         .canonicalize()
         .with_context(|| format!("canonicalizing root {}", root.display()))?;
@@ -652,7 +656,6 @@ fn index_docs_root(root: &Path) -> anyhow::Result<DocsIndexSummary> {
         bail!("docs root is not a directory: {}", canonical_root.display());
     }
 
-    let db_path = default_db_path();
     if let Some(parent) = db_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating parent dir for {}", db_path.display()))?;
@@ -674,7 +677,6 @@ fn index_docs_root(root: &Path) -> anyhow::Result<DocsIndexSummary> {
     let mut indexed = 0usize;
     let mut updated = 0usize;
     let skipped = scan.skipped;
-    let mut deleted = 0usize;
     for doc in &scan.docs {
         let existing: Option<(String, i64, String)> = tx
             .query_row(
@@ -763,7 +765,7 @@ fn index_docs_root(root: &Path) -> anyhow::Result<DocsIndexSummary> {
         let rows = stmt.query_map(params![root_id, generation], |row| row.get(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
-    deleted = stale_ids.len();
+    let deleted = stale_ids.len();
     for stale_id in &stale_ids {
         tx.execute(
             "DELETE FROM fts_documents WHERE document_id = ?1",
