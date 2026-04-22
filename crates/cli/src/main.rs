@@ -671,6 +671,9 @@ fn index_docs_root(root: &Path) -> anyhow::Result<DocsIndexSummary> {
     let scan = scan_docs_tree(&canonical_root, &root_id)?;
 
     let tx = conn.transaction()?;
+    let mut indexed = 0usize;
+    let mut updated = 0usize;
+    let skipped = scan.skipped;
     let mut deleted = 0usize;
     for doc in &scan.docs {
         let existing: Option<(String, i64, String)> = tx
@@ -696,6 +699,12 @@ fn index_docs_root(root: &Path) -> anyhow::Result<DocsIndexSummary> {
                 params![root_id, doc.relative_path, generation, now],
             )?;
             continue;
+        }
+
+        if existing.is_some() {
+            updated += 1;
+        } else {
+            indexed += 1;
         }
 
         tx.execute(
@@ -739,10 +748,6 @@ fn index_docs_root(root: &Path) -> anyhow::Result<DocsIndexSummary> {
                 doc.content
             ],
         )?;
-
-        if existing.is_some() {
-            deleted += 0;
-        }
     }
 
     let stale_ids: Vec<String> = {
@@ -774,9 +779,9 @@ fn index_docs_root(root: &Path) -> anyhow::Result<DocsIndexSummary> {
     tx.commit()?;
 
     Ok(DocsIndexSummary {
-        indexed: scan.indexed,
-        updated: scan.updated,
-        skipped: scan.skipped,
+        indexed,
+        updated,
+        skipped,
         deleted,
         errors: scan.errors,
     })
@@ -784,15 +789,12 @@ fn index_docs_root(root: &Path) -> anyhow::Result<DocsIndexSummary> {
 
 struct DocsScan {
     docs: Vec<ScannedDoc>,
-    indexed: usize,
-    updated: usize,
     skipped: usize,
     errors: usize,
 }
 
 fn scan_docs_tree(root: &Path, root_id: &str) -> anyhow::Result<DocsScan> {
     let mut docs = Vec::new();
-    let mut indexed = 0usize;
     let mut skipped = 0usize;
     let mut errors = 0usize;
     let mut stack = vec![root.to_path_buf()];
@@ -874,19 +876,12 @@ fn scan_docs_tree(root: &Path, root_id: &str) -> anyhow::Result<DocsScan> {
                 content_hash,
                 content,
             });
-            indexed += 1;
         }
     }
 
     docs.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
 
-    Ok(DocsScan {
-        updated: indexed,
-        indexed,
-        docs,
-        skipped,
-        errors,
-    })
+    Ok(DocsScan { docs, skipped, errors })
 }
 
 fn ensure_docs_schema(conn: &Connection) -> anyhow::Result<()> {
