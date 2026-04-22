@@ -28,6 +28,7 @@ fn remi_cmd(data_home: &Path) -> Command {
 
 fn seed_session_store(data_home: &Path, query_term: &str) {
     let db_path = data_home.join("remi").join("remi.db");
+    fs::create_dir_all(db_path.parent().unwrap()).unwrap();
     let mut store = SqliteStore::open(&db_path).unwrap();
     store.init_schema().unwrap();
 
@@ -147,6 +148,7 @@ fn docs_index_search_allowlist_and_regressions() {
     let data_home = fresh_data_home();
     let docs_root = data_home.join("docs-root");
     fs::create_dir_all(docs_root.join("nested")).unwrap();
+    seed_session_store(&data_home, "known-session-term");
 
     fs::write(
         docs_root.join("guide.md"),
