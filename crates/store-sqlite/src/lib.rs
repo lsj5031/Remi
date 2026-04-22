@@ -981,7 +981,7 @@ impl SqliteStore {
             by_agent.entry(s.agent.as_str()).or_default().push(s);
         }
         for grouped in by_agent.values_mut() {
-            grouped.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+            grouped.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
             for s in grouped.iter().skip(keep_latest) {
                 if s.updated_at < cutoff {
                     let already_planned: bool = self.conn.query_row(
