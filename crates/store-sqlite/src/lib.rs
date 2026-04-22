@@ -213,6 +213,46 @@ impl SqliteStore {
                 "#,
             )?;
         }
+        if version < 3 {
+            self.conn.execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS doc_roots (
+                  root_id TEXT PRIMARY KEY,
+                  canonical_path TEXT NOT NULL UNIQUE,
+                  current_generation INTEGER NOT NULL DEFAULT 0,
+                  last_completed_generation INTEGER NOT NULL DEFAULT 0,
+                  scan_started_at TEXT,
+                  scan_completed_at TEXT,
+                  scan_status TEXT NOT NULL DEFAULT 'idle'
+                );
+                CREATE TABLE IF NOT EXISTS documents (
+                  id TEXT PRIMARY KEY,
+                  root_id TEXT NOT NULL,
+                  relative_path TEXT NOT NULL,
+                  title TEXT NOT NULL,
+                  modified_at TEXT NOT NULL,
+                  size_bytes INTEGER NOT NULL,
+                  content_hash TEXT NOT NULL,
+                  last_seen_generation INTEGER NOT NULL,
+                  indexed_generation INTEGER NOT NULL,
+                  indexed_at TEXT NOT NULL,
+                  FOREIGN KEY(root_id) REFERENCES doc_roots(root_id) ON DELETE CASCADE,
+                  UNIQUE(root_id, relative_path)
+                );
+                CREATE VIRTUAL TABLE IF NOT EXISTS fts_documents USING fts5(
+                  document_id UNINDEXED,
+                  root_id UNINDEXED,
+                  path,
+                  title,
+                  content,
+                  tokenize = 'unicode61 tokenchars ''_./:-'''
+                );
+                CREATE INDEX IF NOT EXISTS idx_documents_root_id ON documents(root_id);
+                CREATE INDEX IF NOT EXISTS idx_documents_root_generation ON documents(root_id, last_seen_generation);
+                PRAGMA user_version = 3;
+                "#,
+            )?;
+        }
         for (id, name) in [
             ("pi", "pi"),
             ("droid", "droid"),
