@@ -359,6 +359,7 @@ dependencies = [
  "anyhow",
  "archive",
  "askama",
+ "blake3",
  "chrono",
  "clap",
  "claude",
@@ -374,6 +375,7 @@ dependencies = [
  "owo-colors",
  "pi",
  "pulldown-cmark",
+ "rusqlite",
  "search",
  "serde",
  "serde_json",
@@ -1524,6 +1526,7 @@ dependencies = [
  "chrono",
  "core-model",
  "embeddings",
+ "rusqlite",
  "store-sqlite",
  "tracing",
 ]

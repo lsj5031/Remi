@@ -686,9 +686,13 @@ fn index_docs_root(root: &Path) -> anyhow::Result<DocsIndexSummary> {
             )
             .optional()?;
 
-        let unchanged = existing.as_ref().is_some_and(|(modified_at, size, content_hash)| {
-            modified_at == &doc.modified_at && *size == doc.size && content_hash == &doc.content_hash
-        });
+        let unchanged = existing
+            .as_ref()
+            .is_some_and(|(modified_at, size, content_hash)| {
+                modified_at == &doc.modified_at
+                    && *size == doc.size
+                    && content_hash == &doc.content_hash
+            });
         if unchanged {
             tx.execute(
                 "UPDATE documents
@@ -800,8 +804,8 @@ fn scan_docs_tree(root: &Path, root_id: &str) -> anyhow::Result<DocsScan> {
     let mut stack = vec![root.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
-        let entries = fs::read_dir(&dir)
-            .with_context(|| format!("reading directory {}", dir.display()))?;
+        let entries =
+            fs::read_dir(&dir).with_context(|| format!("reading directory {}", dir.display()))?;
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -881,7 +885,11 @@ fn scan_docs_tree(root: &Path, root_id: &str) -> anyhow::Result<DocsScan> {
 
     docs.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
 
-    Ok(DocsScan { docs, skipped, errors })
+    Ok(DocsScan {
+        docs,
+        skipped,
+        errors,
+    })
 }
 
 fn ensure_docs_schema(conn: &Connection) -> anyhow::Result<()> {
