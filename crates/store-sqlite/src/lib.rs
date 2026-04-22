@@ -452,7 +452,7 @@ impl SqliteStore {
 
     pub fn get_session_messages(&self, session_id: &str) -> anyhow::Result<Vec<Message>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, session_id, role, content, ts FROM messages WHERE session_id = ?1 ORDER BY ts ASC",
+            "SELECT id, session_id, role, content, ts FROM messages WHERE session_id = ?1 ORDER BY ts ASC, rowid ASC",
         )?;
         let rows = stmt.query_map(params![session_id], |r| {
             Ok(Message {
@@ -845,6 +845,55 @@ mod tests {
         let msgs = store.get_session_messages("s2").unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].content, "test content");
+    }
+
+    #[test]
+    fn get_session_messages_is_stable_when_timestamps_match() {
+        let mut store = SqliteStore::open(":memory:").unwrap();
+        store.init_schema().unwrap();
+        let now = Utc::now();
+        let batch = NormalizedBatch {
+            sessions: vec![Session {
+                id: "s_same_ts".to_string(),
+                agent: core_model::AgentKind::Codex,
+                source_ref: "same-ts".to_string(),
+                title: "same ts".to_string(),
+                created_at: now,
+                updated_at: now,
+            }],
+            messages: vec![
+                Message {
+                    id: "m1".to_string(),
+                    session_id: "s_same_ts".to_string(),
+                    role: "user".to_string(),
+                    content: "first".to_string(),
+                    ts: now,
+                },
+                Message {
+                    id: "m2".to_string(),
+                    session_id: "s_same_ts".to_string(),
+                    role: "assistant".to_string(),
+                    content: "second".to_string(),
+                    ts: now,
+                },
+                Message {
+                    id: "m3".to_string(),
+                    session_id: "s_same_ts".to_string(),
+                    role: "user".to_string(),
+                    content: "third".to_string(),
+                    ts: now,
+                },
+            ],
+            events: vec![],
+            artifacts: vec![],
+            provenance: vec![],
+        };
+
+        store.save_batch(&batch).unwrap();
+
+        let msgs = store.get_session_messages("s_same_ts").unwrap();
+        let contents = msgs.into_iter().map(|msg| msg.content).collect::<Vec<_>>();
+        assert_eq!(contents, vec!["first", "second", "third"]);
     }
 
     #[test]

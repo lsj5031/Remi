@@ -10,6 +10,8 @@ use tracing::debug;
 
 pub struct PiAdapter;
 
+const PI_CURSOR_PREFIX: &str = "pi-v2|";
+
 impl AgentAdapter for PiAdapter {
     fn kind(&self) -> AgentKind {
         AgentKind::Pi
@@ -44,6 +46,7 @@ impl AgentAdapter for PiAdapter {
 
     fn checkpoint_cursor(&self, records: &[NativeRecord]) -> Option<String> {
         adapter_common::checkpoint_cursor_from_records(records)
+            .map(|cursor| format!("{PI_CURSOR_PREFIX}{cursor}"))
     }
 
     fn archive_capability(&self) -> ArchiveCapability {
@@ -79,11 +82,82 @@ fn extract_text_only(content: Option<&Value>) -> String {
     parts.join("\n")
 }
 
+fn extract_message_content(role: &str, content: Option<&Value>) -> String {
+    if role == "toolResult" {
+        let text = extract_text_only(content);
+        if text.is_empty() {
+            return String::new();
+        }
+        return format!("tool_result: {text}");
+    }
+
+    let Some(Value::Array(arr)) = content else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    for item in arr {
+        let Some(obj) = item.as_object() else {
+            continue;
+        };
+        match obj.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = obj.get("text").and_then(Value::as_str) {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        parts.push(trimmed.to_string());
+                    }
+                }
+            }
+            Some("toolCall") => {
+                if let Some(line) = format_tool_call(obj) {
+                    parts.push(line);
+                }
+            }
+            _ => {}
+        }
+    }
+    parts.join("\n")
+}
+
+fn format_tool_call(obj: &serde_json::Map<String, Value>) -> Option<String> {
+    let name = obj
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let arguments = obj
+        .get("arguments")
+        .filter(|value| !value.is_null())
+        .map(Value::to_string)
+        .filter(|value| !value.is_empty());
+
+    if name.is_none() && arguments.is_none() {
+        return None;
+    }
+
+    let mut out = String::from("tool_use");
+    if let Some(name) = name {
+        out.push_str(": ");
+        out.push_str(name);
+    }
+    if let Some(arguments) = arguments {
+        if name.is_some() {
+            out.push(' ');
+        } else {
+            out.push_str(": ");
+        }
+        out.push_str(&arguments);
+    }
+    Some(out)
+}
+
 fn load_pi_jsonl(
     source_paths: &[String],
     cursor: Option<&str>,
 ) -> anyhow::Result<Vec<NativeRecord>> {
-    let parsed_cursor = cursor.and_then(adapter_common::parse_cursor);
+    let parsed_cursor = cursor
+        .and_then(|cursor| cursor.strip_prefix(PI_CURSOR_PREFIX))
+        .and_then(adapter_common::parse_cursor);
     let mut out: Vec<NativeRecord> = source_paths
         .par_iter()
         .flat_map(|path| {
@@ -110,7 +184,7 @@ fn load_pi_jsonl(
             let mut cwd: Option<String> = None;
             let mut first_user_text: Option<String> = None;
             let mut records = Vec::new();
-            let mut msg_index = 0usize;
+            let mut visible_msg_index = 0usize;
 
             for line in &lines {
                 let trimmed = line.trim();
@@ -147,18 +221,14 @@ fn load_pi_jsonl(
                         };
                         let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
 
-                        if role == "toolResult" {
-                            continue;
-                        }
-
-                        let content_text = extract_text_only(msg.get("content"));
+                        let content_text = extract_message_content(role, msg.get("content"));
                         if content_text.is_empty() {
                             continue;
                         }
 
                         let mapped_role = match role {
-                            "user" | "assistant" => role,
-                            _ => "user",
+                            "user" => "user",
+                            _ => "assistant",
                         };
 
                         if mapped_role == "user" && first_user_text.is_none() {
@@ -174,8 +244,19 @@ fn load_pi_jsonl(
                         } else {
                             session_id.clone()
                         };
-                        let source_id = format!("{sid}:{msg_index}");
-                        msg_index += 1;
+                        let source_id = if role == "toolResult" {
+                            let tool_result_id = val
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .filter(|id| !id.is_empty())
+                                .map(ToOwned::to_owned)
+                                .unwrap_or_else(|| deterministic_id(&[path, trimmed]));
+                            format!("{sid}:toolResult:{tool_result_id}")
+                        } else {
+                            let source_id = format!("{sid}:{visible_msg_index}");
+                            visible_msg_index += 1;
+                            source_id
+                        };
 
                         if let Some(ref cur) = parsed_cursor
                             && adapter_common::should_skip(line_ts, &source_id, cur)
@@ -195,7 +276,7 @@ fn load_pi_jsonl(
                             .unwrap_or_else(|| sid.clone());
 
                         let mut obj = serde_json::Map::new();
-                        obj.insert("role".to_string(), Value::String(mapped_role.to_string()));
+                        obj.insert("role".to_string(), Value::String(role.to_string()));
                         if let Some(content) = msg.get("content") {
                             obj.insert("content".to_string(), content.clone());
                         } else {
@@ -248,7 +329,8 @@ fn normalize_records(records: &[NativeRecord]) -> NormalizedBatch {
             .and_then(Value::as_str)
             .unwrap_or("user")
             .to_string();
-        let content = extract_text_only(rec.payload.get("content"));
+        let normalized_role = if role == "user" { "user" } else { "assistant" };
+        let content = extract_message_content(&role, rec.payload.get("content"));
         if content.is_empty() {
             continue;
         }
@@ -297,7 +379,7 @@ fn normalize_records(records: &[NativeRecord]) -> NormalizedBatch {
         batch.messages.push(core_model::Message {
             id: message_id.clone(),
             session_id: session_id.clone(),
-            role,
+            role: normalized_role.to_string(),
             content,
             ts: rec.updated_at,
         });
@@ -410,25 +492,56 @@ mod tests {
     }
 
     #[test]
-    fn skip_tool_result_messages() {
+    fn preserves_tool_calls_and_tool_results() {
         let dir = tempdir();
         let path = write_session(
             &dir,
             &[
                 r#"{"type":"session","version":3,"id":"sess-pi-2","timestamp":"2026-02-08T10:54:12.530Z","cwd":"/tmp"}"#,
                 r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-02-08T10:55:00.000Z","message":{"role":"user","content":[{"type":"text","text":"run tests"}]}}"#,
-                r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-02-08T10:55:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Running tests now"}]}}"#,
+                r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-02-08T10:55:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Running tests now"},{"type":"toolCall","id":"call_xxx","name":"bash","arguments":{"command":"cargo test"}}]}}"#,
                 r#"{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-02-08T10:55:02.000Z","message":{"role":"toolResult","toolCallId":"call_xxx","toolName":"bash","content":[{"type":"text","text":"all tests passed"}]}}"#,
                 r#"{"type":"message","id":"m4","parentId":"m3","timestamp":"2026-02-08T10:55:03.000Z","message":{"role":"assistant","content":[{"type":"text","text":"All tests passed!"}]}}"#,
             ],
         );
         let records = load_pi_jsonl(&[path], None).unwrap();
-        assert_eq!(records.len(), 3);
+        assert_eq!(records.len(), 4);
+        let source_ids: Vec<&str> = records.iter().map(|r| r.source_id.as_str()).collect();
+        assert_eq!(
+            source_ids,
+            vec![
+                "sess-pi-2:0",
+                "sess-pi-2:1",
+                "sess-pi-2:toolResult:m3",
+                "sess-pi-2:2",
+            ]
+        );
         let roles: Vec<&str> = records
             .iter()
             .map(|r| r.payload.get("role").unwrap().as_str().unwrap())
             .collect();
-        assert_eq!(roles, vec!["user", "assistant", "assistant"]);
+        assert_eq!(roles, vec!["user", "assistant", "toolResult", "assistant"]);
+
+        let batch = normalize_records(&records);
+        let batch_roles: Vec<&str> = batch.messages.iter().map(|msg| msg.role.as_str()).collect();
+        assert_eq!(
+            batch_roles,
+            vec!["user", "assistant", "assistant", "assistant"]
+        );
+        let contents: Vec<&str> = batch
+            .messages
+            .iter()
+            .map(|msg| msg.content.as_str())
+            .collect();
+        assert_eq!(
+            contents,
+            vec![
+                "run tests",
+                "Running tests now\ntool_use: bash {\"command\":\"cargo test\"}",
+                "tool_result: all tests passed",
+                "All tests passed!",
+            ]
+        );
     }
 
     #[test]
@@ -480,5 +593,42 @@ mod tests {
         assert_eq!(batch.messages[1].role, "assistant");
         assert_eq!(batch.messages[1].content, "Looking at the code...");
         assert_eq!(batch.provenance[0].source_path, "/home/leo/code/Remi");
+    }
+
+    #[test]
+    fn ignores_legacy_checkpoint_format_for_full_rescan() {
+        let dir = tempdir();
+        let path = write_session(
+            &dir,
+            &[
+                r#"{"type":"session","version":3,"id":"sess-pi-3","timestamp":"2026-02-08T10:54:12.530Z","cwd":"/tmp"}"#,
+                r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-02-08T10:55:00.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}"#,
+            ],
+        );
+
+        let legacy_cursor = "2026-02-08T10:55:00+00:00\x1fsess-pi-3:0";
+        let records = load_pi_jsonl(&[path], Some(legacy_cursor)).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source_id, "sess-pi-3:0");
+    }
+
+    #[test]
+    fn versioned_checkpoint_still_filters_seen_records() {
+        let dir = tempdir();
+        let path = write_session(
+            &dir,
+            &[
+                r#"{"type":"session","version":3,"id":"sess-pi-4","timestamp":"2026-02-08T10:54:12.530Z","cwd":"/tmp"}"#,
+                r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-02-08T10:55:00.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}"#,
+                r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-02-08T10:55:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"world"}]}}"#,
+            ],
+        );
+
+        let cursor = format!("{PI_CURSOR_PREFIX}2026-02-08T10:55:00+00:00\x1fsess-pi-4:0");
+        let records = load_pi_jsonl(&[path], Some(&cursor)).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source_id, "sess-pi-4:1");
     }
 }
