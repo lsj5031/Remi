@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::path::Path;
 
+use anyhow::Context;
 #[cfg(feature = "semantic")]
 use chrono::{DateTime, Utc};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use store_sqlite::SqliteStore;
 use tracing::debug;
@@ -22,6 +25,14 @@ pub struct SessionHit {
     pub session_id: String,
     pub top_message_id: String,
     pub top_content: String,
+    pub score: f32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocHit {
+    pub path: String,
+    pub title: String,
+    pub snippet: String,
     pub score: f32,
 }
 
@@ -247,6 +258,90 @@ pub fn search_sessions(
     Ok(out)
 }
 
+pub fn search_docs_at(
+    db_path: impl AsRef<Path>,
+    query: &str,
+    limit: usize,
+    raw_fts: bool,
+) -> anyhow::Result<Vec<DocHit>> {
+    let conn = Connection::open(db_path.as_ref())
+        .with_context(|| format!("opening sqlite db {}", db_path.as_ref().display()))?;
+    if !has_docs_index(&conn)? {
+        return Ok(Vec::new());
+    }
+    search_docs_conn(&conn, query, limit, raw_fts)
+}
+
+fn search_docs_conn(
+    conn: &Connection,
+    query: &str,
+    limit: usize,
+    raw_fts: bool,
+) -> anyhow::Result<Vec<DocHit>> {
+    let fts_query = if raw_fts {
+        query.trim().to_string()
+    } else {
+        sanitize_fts_query(query)
+    };
+    debug!(raw_query = %query, fts_query = %fts_query, raw_fts, "docs search query prepared");
+
+    if !fts_query.is_empty() {
+        let mut stmt = conn.prepare(
+            "SELECT path,
+                    COALESCE(NULLIF(title, ''), path) AS title,
+                    snippet(fts_documents, 2, '[', ']', ' … ', 18) AS snippet,
+                    bm25(fts_documents) AS rank
+             FROM fts_documents
+             WHERE fts_documents MATCH ?1
+             ORDER BY rank
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![fts_query, limit as i64], |row| {
+            let rank: f64 = row.get(3)?;
+            Ok(DocHit {
+                path: row.get(0)?,
+                title: row.get(1)?,
+                snippet: row.get(2)?,
+                score: (-rank) as f32,
+            })
+        })?;
+        let hits = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        if !hits.is_empty() {
+            return Ok(hits);
+        }
+    }
+
+    if query.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let pattern = format!("%{}%", escape_like_pattern(&query.to_lowercase()));
+    let mut stmt = conn.prepare(
+        "SELECT path,
+                COALESCE(NULLIF(title, ''), path) AS title,
+                content
+         FROM fts_documents
+         WHERE lower(path) LIKE ?1 ESCAPE '\\'
+            OR lower(title) LIKE ?1 ESCAPE '\\'
+            OR lower(content) LIKE ?1 ESCAPE '\\'
+         ORDER BY path
+         LIMIT ?2",
+    )?;
+    let rows = stmt.query_map(params![pattern, limit as i64], |row| {
+        let path: String = row.get(0)?;
+        let title: String = row.get(1)?;
+        let content: String = row.get(2)?;
+        Ok(DocHit {
+            path,
+            title,
+            snippet: fallback_doc_snippet(&content, query),
+            score: 0.0,
+        })
+    })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
 fn sanitize_fts_query(query: &str) -> String {
     let terms: Vec<String> = query
         .split_whitespace()
@@ -274,6 +369,52 @@ fn sanitize_fts_query(query: &str) -> String {
     terms.join(" OR ")
 }
 
+fn has_docs_index(conn: &Connection) -> anyhow::Result<bool> {
+    conn.query_row(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'fts_documents'",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map(|row| row.is_some())
+    .map_err(Into::into)
+}
+
+fn escape_like_pattern(query: &str) -> String {
+    let mut escaped = String::with_capacity(query.len());
+    for ch in query.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+fn fallback_doc_snippet(content: &str, query: &str) -> String {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let query_lower = query.to_lowercase();
+    let content_lower = content.to_lowercase();
+    if let Some(pos) = content_lower.find(&query_lower) {
+        let start = pos.saturating_sub(60);
+        let end = (pos + query_lower.len() + 100).min(content.len());
+        let prefix = if start > 0 { "… " } else { "" };
+        let suffix = if end < content.len() { " …" } else { "" };
+        return format!("{}{}{}", prefix, content[start..end].trim(), suffix);
+    }
+
+    let snippet: String = trimmed.chars().take(180).collect();
+    if trimmed.chars().count() > 180 {
+        format!("{snippet}…")
+    } else {
+        snippet
+    }
+}
+
 #[cfg(feature = "semantic")]
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
@@ -291,6 +432,8 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use core_model::{AgentKind, Message, NormalizedBatch, Session};
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn setup_store() -> SqliteStore {
         let store = SqliteStore::open(":memory:").unwrap();
@@ -328,6 +471,55 @@ mod tests {
         let mut store_mut = store;
         store_mut.save_batch(&batch).unwrap();
         store_mut
+    }
+
+    fn temp_db_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("remi-search-{name}-{unique}.db"))
+    }
+
+    fn setup_docs_db(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE VIRTUAL TABLE fts_documents USING fts5(
+                document_id UNINDEXED,
+                root_id UNINDEXED,
+                path,
+                title,
+                content,
+                tokenize = 'unicode61 tokenchars ''_./:-'''
+            );
+            "#,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fts_documents (document_id, root_id, path, title, content)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "doc-1",
+                "root-1",
+                "guides/setup.md",
+                "Setup Guide",
+                "Install remi and keep the docs-search token nearby."
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fts_documents (document_id, root_id, path, title, content)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "doc-2",
+                "root-1",
+                "notes/faq.txt",
+                "FAQ",
+                "Troubleshooting notes for indexing behaviour."
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -396,5 +588,32 @@ mod tests {
         let hits = search(&store, "progr", 10, false).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].message_id, "m1");
+    }
+
+    #[test]
+    fn docs_search_returns_doc_hits() {
+        let db_path = temp_db_path("docs-fts");
+        setup_docs_db(&db_path);
+
+        let hits = search_docs_at(&db_path, "docs-search", 10, false).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "guides/setup.md");
+        assert_eq!(hits[0].title, "Setup Guide");
+        assert!(hits[0].snippet.contains("docs-search"));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn docs_search_falls_back_to_substring_when_fts_misses() {
+        let db_path = temp_db_path("docs-substring");
+        setup_docs_db(&db_path);
+
+        let hits = search_docs_at(&db_path, "docs-sear", 10, false).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "guides/setup.md");
+        assert!(hits[0].snippet.to_lowercase().contains("docs-search"));
+
+        let _ = std::fs::remove_file(db_path);
     }
 }

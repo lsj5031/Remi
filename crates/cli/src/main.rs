@@ -1,9 +1,15 @@
-use std::{cell::RefCell, path::PathBuf, time::Instant};
+use std::{
+    cell::RefCell,
+    fs,
+    path::{Path, PathBuf},
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ingest::SyncPhase;
 use render::HtmlSafety;
+use rusqlite::{Connection, OptionalExtension, params};
 use store_sqlite::SqliteStore;
 use tracing::{debug, info, trace};
 
@@ -30,6 +36,10 @@ struct Cli {
 enum Commands {
     Init,
     Sync(SyncArgs),
+    Docs {
+        #[command(subcommand)]
+        command: DocsCommand,
+    },
     Sessions {
         #[command(subcommand)]
         command: SessionsCommand,
@@ -71,6 +81,21 @@ enum AgentOpt {
 enum SessionsCommand {
     List,
     Show { session_id: String },
+}
+
+#[derive(Subcommand)]
+enum DocsCommand {
+    Index {
+        #[arg(long)]
+        root: PathBuf,
+    },
+    Search {
+        query: String,
+        #[arg(long, default_value_t = false)]
+        raw_fts: bool,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -175,6 +200,7 @@ fn command_name(cmd: &Commands) -> &'static str {
     match cmd {
         Commands::Init => "init",
         Commands::Sync(_) => "sync",
+        Commands::Docs { .. } => "docs",
         Commands::Sessions { .. } => "sessions",
         Commands::Search { .. } => "search",
         Commands::Archive { .. } => "archive",
