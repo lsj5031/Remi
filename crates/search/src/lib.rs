@@ -289,7 +289,7 @@ fn search_docs_conn(
         let mut stmt = conn.prepare(
             "SELECT path,
                     COALESCE(NULLIF(title, ''), path) AS title,
-                    snippet(fts_documents, 2, '[', ']', ' … ', 18) AS snippet,
+                    snippet(fts_documents, 4, '[', ']', ' … ', 18) AS snippet,
                     bm25(fts_documents) AS rank
              FROM fts_documents
              WHERE fts_documents MATCH ?1
@@ -599,7 +599,7 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "guides/setup.md");
         assert_eq!(hits[0].title, "Setup Guide");
-        assert!(!hits[0].snippet.trim().is_empty());
+        assert!(hits[0].snippet.to_lowercase().contains("docs-search"));
         assert!(hits[0].score > 0.0);
 
         let _ = std::fs::remove_file(db_path);

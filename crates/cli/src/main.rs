@@ -660,7 +660,7 @@ fn index_docs_root_with_db(root: &Path, db_path: &Path) -> anyhow::Result<DocsIn
         fs::create_dir_all(parent)
             .with_context(|| format!("creating parent dir for {}", db_path.display()))?;
     }
-    let mut conn = Connection::open(&db_path)
+    let mut conn = Connection::open(db_path)
         .with_context(|| format!("opening sqlite db {}", db_path.display()))?;
     conn.execute_batch(
         "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
@@ -998,10 +998,10 @@ fn is_hidden_name(name: &std::ffi::OsStr) -> bool {
 fn doc_title(path: &Path, content: &str) -> String {
     for line in content.lines() {
         let trimmed = line.trim();
-        if let Some(title) = trimmed.strip_prefix("# ") {
-            if !title.trim().is_empty() {
-                return title.trim().to_string();
-            }
+        if let Some(title) = trimmed.strip_prefix("# ")
+            && !title.trim().is_empty()
+        {
+            return title.trim().to_string();
         }
     }
     path.file_stem()
