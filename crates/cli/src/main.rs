@@ -332,6 +332,46 @@ fn main() -> anyhow::Result<()> {
             };
             info!(records = synced, elapsed = ?t.elapsed(), "synced");
         }
+        Commands::Docs { command } => match command {
+            DocsCommand::Index { root } => {
+                let summary = index_docs_root(&root)?;
+                info!(
+                    root = %root.display(),
+                    indexed = summary.indexed,
+                    updated = summary.updated,
+                    skipped = summary.skipped,
+                    deleted = summary.deleted,
+                    errors = summary.errors,
+                    elapsed = ?t.elapsed(),
+                    "docs index complete"
+                );
+                println!("root={}", root.display());
+                println!("indexed={}", summary.indexed);
+                println!("updated={}", summary.updated);
+                println!("skipped={}", summary.skipped);
+                println!("deleted={}", summary.deleted);
+                println!("errors={}", summary.errors);
+            }
+            DocsCommand::Search {
+                query,
+                raw_fts,
+                limit,
+            } => {
+                info!(query = %query, raw_fts, limit, "docs searching");
+                let hits = search::search_docs_at(default_db_path(), &query, limit, raw_fts)?;
+                debug!(hits = hits.len(), "docs search returned hits");
+                if hits.is_empty() {
+                    info!(elapsed = ?t.elapsed(), "no docs results");
+                    return Ok(());
+                }
+                for hit in hits {
+                    println!("{}", hit.title);
+                    println!("  path: {}", hit.path);
+                    println!("  snippet: {}", hit.snippet);
+                    println!();
+                }
+            }
+        },
         Commands::Sessions { command } => match command {
             SessionsCommand::List => {
                 let sessions = store.list_sessions()?;
