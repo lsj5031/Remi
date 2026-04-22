@@ -1073,8 +1073,7 @@ fn document_id(root_id: &str, relative_path: &str) -> String {
 
 fn build_document_snippet(content: &str, query: &str) -> String {
     const MAX_CHARS: usize = 180;
-    let collapsed = content.split_whitespace().collect::<Vec<_>>().join(" "
-    );
+    let collapsed = content.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.is_empty() {
         return String::new();
     }
@@ -1583,7 +1582,9 @@ mod tests {
             "Intro",
             "Rust docs token for lexical search",
         );
-        store.finalize_doc_sync(&sync.root_id, sync.generation).unwrap();
+        store
+            .finalize_doc_sync(&sync.root_id, sync.generation)
+            .unwrap();
 
         let root = store.get_doc_root("/tmp/docs").unwrap().unwrap();
         assert_eq!(root.root_id, sync.root_id);
@@ -1610,22 +1611,32 @@ mod tests {
         let sync1 = store.begin_doc_sync("/tmp/docs").unwrap();
         upsert_test_document(&mut store, &sync1, "a.md", "A", "alpha token");
         upsert_test_document(&mut store, &sync1, "b.md", "B", "beta token");
-        store.finalize_doc_sync(&sync1.root_id, sync1.generation).unwrap();
+        store
+            .finalize_doc_sync(&sync1.root_id, sync1.generation)
+            .unwrap();
 
         let sync2 = store.begin_doc_sync("/tmp/docs").unwrap();
-        assert!(store
-            .mark_document_seen(&sync2.root_id, "a.md", sync2.generation)
-            .unwrap());
-        let finalize = store.finalize_doc_sync(&sync2.root_id, sync2.generation).unwrap();
+        assert!(
+            store
+                .mark_document_seen(&sync2.root_id, "a.md", sync2.generation)
+                .unwrap()
+        );
+        let finalize = store
+            .finalize_doc_sync(&sync2.root_id, sync2.generation)
+            .unwrap();
         assert_eq!(finalize.deleted_documents, 1);
-        assert!(store
-            .get_document_by_path(&sync2.root_id, "a.md")
-            .unwrap()
-            .is_some());
-        assert!(store
-            .get_document_by_path(&sync2.root_id, "b.md")
-            .unwrap()
-            .is_none());
+        assert!(
+            store
+                .get_document_by_path(&sync2.root_id, "a.md")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get_document_by_path(&sync2.root_id, "b.md")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1636,22 +1647,32 @@ mod tests {
         let sync1 = store.begin_doc_sync("/tmp/docs").unwrap();
         upsert_test_document(&mut store, &sync1, "keep.md", "Keep", "keep token");
         upsert_test_document(&mut store, &sync1, "stale.md", "Stale", "stale token");
-        store.finalize_doc_sync(&sync1.root_id, sync1.generation).unwrap();
+        store
+            .finalize_doc_sync(&sync1.root_id, sync1.generation)
+            .unwrap();
 
         let sync2 = store.begin_doc_sync("/tmp/docs").unwrap();
-        assert!(store
-            .mark_document_seen(&sync2.root_id, "keep.md", sync2.generation)
-            .unwrap());
-        store.fail_doc_sync(&sync2.root_id, sync2.generation).unwrap();
+        assert!(
+            store
+                .mark_document_seen(&sync2.root_id, "keep.md", sync2.generation)
+                .unwrap()
+        );
+        store
+            .fail_doc_sync(&sync2.root_id, sync2.generation)
+            .unwrap();
 
-        assert!(store
-            .get_document_by_path(&sync2.root_id, "keep.md")
-            .unwrap()
-            .is_some());
-        assert!(store
-            .get_document_by_path(&sync2.root_id, "stale.md")
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .get_document_by_path(&sync2.root_id, "keep.md")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get_document_by_path(&sync2.root_id, "stale.md")
+                .unwrap()
+                .is_some()
+        );
         let root = store.get_doc_root("/tmp/docs").unwrap().unwrap();
         assert_eq!(root.last_completed_generation, 1);
         assert_eq!(root.scan_status, "failed");
@@ -1664,21 +1685,29 @@ mod tests {
 
         let sync1 = store.begin_doc_sync("/tmp/docs").unwrap();
         upsert_test_document(&mut store, &sync1, "old-name.md", "Old", "rename token");
-        store.finalize_doc_sync(&sync1.root_id, sync1.generation).unwrap();
+        store
+            .finalize_doc_sync(&sync1.root_id, sync1.generation)
+            .unwrap();
 
         let sync2 = store.begin_doc_sync("/tmp/docs").unwrap();
         upsert_test_document(&mut store, &sync2, "new-name.md", "New", "rename token");
-        let finalize = store.finalize_doc_sync(&sync2.root_id, sync2.generation).unwrap();
+        let finalize = store
+            .finalize_doc_sync(&sync2.root_id, sync2.generation)
+            .unwrap();
 
         assert_eq!(finalize.deleted_documents, 1);
-        assert!(store
-            .get_document_by_path(&sync2.root_id, "old-name.md")
-            .unwrap()
-            .is_none());
-        assert!(store
-            .get_document_by_path(&sync2.root_id, "new-name.md")
-            .unwrap()
-            .is_some());
+        assert!(
+            store
+                .get_document_by_path(&sync2.root_id, "old-name.md")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_document_by_path(&sync2.root_id, "new-name.md")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -1694,7 +1723,9 @@ mod tests {
             "Rust Guide",
             "Rust book content with ferris_token and C++ appendix",
         );
-        store.finalize_doc_sync(&sync.root_id, sync.generation).unwrap();
+        store
+            .finalize_doc_sync(&sync.root_id, sync.generation)
+            .unwrap();
 
         let lexical = store.search_documents_lexical("ferris_token", 10).unwrap();
         assert_eq!(lexical.len(), 1);
