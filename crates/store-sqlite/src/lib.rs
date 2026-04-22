@@ -23,6 +23,54 @@ pub struct SearchRow {
     pub score: f64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocSyncState {
+    pub root_id: String,
+    pub canonical_path: String,
+    pub generation: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocRootRecord {
+    pub root_id: String,
+    pub canonical_path: String,
+    pub current_generation: i64,
+    pub last_completed_generation: i64,
+    pub scan_started_at: Option<DateTime<Utc>>,
+    pub scan_completed_at: Option<DateTime<Utc>>,
+    pub scan_status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentRecord {
+    pub document_id: String,
+    pub root_id: String,
+    pub relative_path: String,
+    pub title: String,
+    pub modified_at: DateTime<Utc>,
+    pub size_bytes: i64,
+    pub content_hash: String,
+    pub last_seen_generation: i64,
+    pub indexed_generation: i64,
+    pub indexed_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocFinalizeResult {
+    pub deleted_documents: usize,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocumentSearchRow {
+    pub document_id: String,
+    pub root_id: String,
+    pub root_path: String,
+    pub relative_path: String,
+    pub title: String,
+    pub snippet: String,
+    pub score: f64,
+}
+
 #[cfg(feature = "semantic")]
 #[derive(Debug, Clone, Default)]
 pub struct EmbeddingStats {
