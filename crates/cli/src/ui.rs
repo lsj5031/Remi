@@ -184,7 +184,7 @@ pub fn fuzzy_filter_sessions(
             Some((total, item.clone()))
         })
         .collect();
-    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.sort_by_key(|entry| std::cmp::Reverse(entry.0));
     (scored.into_iter().map(|(_, item)| item).collect(), terms)
 }
 
@@ -269,7 +269,7 @@ pub fn highlight_terms(text: &str, terms: &[String], use_color: bool) -> String 
     if ranges.is_empty() {
         return text.to_string();
     }
-    ranges.sort_by(|a, b| a.0.cmp(&b.0));
+    ranges.sort_by_key(|range| range.0);
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (start, end) in ranges {
         if let Some(last) = merged.last_mut()

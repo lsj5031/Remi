@@ -884,7 +884,7 @@ fn scan_docs_tree(root: &Path, root_id: &str) -> anyhow::Result<DocsScan> {
         }
     }
 
-    docs.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    docs.sort_by_key(|doc| doc.relative_path.clone());
 
     Ok(DocsScan {
         docs,
