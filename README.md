@@ -4,11 +4,11 @@
 [![Release](https://img.shields.io/github/v/release/lsj5031/Remi?display_name=tag)](https://github.com/lsj5031/Remi/releases)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 
-Unified coding-agent session memory for **Pi**, **Factory Droid**, **OpenCode**, **Claude Code**, **Amp**, and **Codex**.
+Unified coding-agent session memory for **Pi**, **Factory Droid**, **OpenCode**, **Claude Code**, **Amp**, and **Codex**, plus separate local-document indexing/search in the same SQLite database.
 
 Tired of hunting through multiple agent transcript formats and folders? Remi gives you one searchable memory layer.
 
-Remi ingests local agent transcripts into one SQLite database, keeps sync state with checkpoints, supports ranked search, and provides safe archive/restore workflows.
+Remi ingests local agent transcripts into one SQLite database, keeps sync state with checkpoints, supports ranked session search, lets you index local documentation roots for separate docs search, and provides safe archive/restore workflows.
 
 Current support status: **Linux-first** (default source discovery paths are validated on Linux).
 
@@ -25,6 +25,7 @@ Current support status: **Linux-first** (default source discovery paths are vali
 - [CLI reference](#cli-reference)
   - [`remi init`](#remi-init)
   - [`remi sync`](#remi-sync)
+  - [`remi docs`](#remi-docs)
   - [`remi sessions`](#remi-sessions)
   - [`remi search query`](#remi-search-query)
   - [`remi archive`](#remi-archive)
@@ -45,10 +46,12 @@ Current support status: **Linux-first** (default source discovery paths are vali
 - **Deterministic IDs** (`blake3`) for idempotent upserts.
 - **Checkpointed ingestion** using a composite cursor (`timestamp + source_id`) to avoid missing same-timestamp records.
 - **Structured content normalization** including tool-call/tool-result payloads into searchable text.
+- **Separate local docs indexing** for user-selected directories, stored in the same SQLite DB as sessions.
 - **Lexical search** using SQLite FTS5 + BM25.
 - **Ranking fusion** with recency via Reciprocal Rank Fusion (RRF).
 - **Substring fallback** when lexical matches are empty.
 - **Two-layer search UX**: ranked session list first, then export selected session to HTML/Markdown (or emit JSON).
+- **Dedicated docs search UX**: query indexed docs directly without mixing them into session search results.
 - **Archive planning/execution/restore** with dry-run defaults and verification before optional deletion.
 
 ---
@@ -65,6 +68,7 @@ Full CLI demo (55s):
 
 ```bash
 remi init && remi sync --agent all && remi search query "panic"
+remi docs index --root ~/docs && remi docs search "retry budget"
 ```
 
 If `remi` is not on your path yet, run from source:
@@ -73,6 +77,8 @@ If `remi` is not on your path yet, run from source:
 cargo run -p cli -- init
 cargo run -p cli -- sync --agent all
 cargo run -p cli -- search query "panic"
+cargo run -p cli -- docs index --root ~/docs
+cargo run -p cli -- docs search "retry budget"
 ```
 
 ---
@@ -113,6 +119,8 @@ Default paths on Linux (via `dirs` crate):
 - **Search exports** (HTML/Markdown default output): `~/.local/share/remi/exports/`
 - **Archive bundles**: `~/.local/share/remi/archive/<run_id>/`
 
+The same database stores both synced sessions and indexed local docs. Docs roots are user-selected via `remi docs index --root <PATH>` rather than auto-discovered.
+
 macOS and Windows builds are available in releases, but default agent source discovery paths are currently Linux-oriented.
 
 ---
@@ -139,6 +147,7 @@ Top-level commands:
 ```text
 remi init
 remi sync --agent <pi|droid|opencode|claude|amp|codex|all>
+remi docs <index|search>
 remi sessions <list|show>
 remi search query <QUERY> [options]
 remi archive <plan|run|restore>
@@ -180,6 +189,68 @@ Behavior:
 - Normalizes to canonical sessions/messages/provenance.
 - Upserts into SQLite + refreshes FTS rows for touched sessions.
 - Updates checkpoint cursor.
+
+---
+
+### `remi docs`
+
+Usage:
+
+```bash
+remi docs index --root <PATH>
+remi docs search [OPTIONS] <QUERY>
+```
+
+`docs index` indexes one local directory root at a time. You can rerun it for the same root to refresh incrementally, or run it again with another root to add more docs roots to the same DB.
+
+Supported document file types:
+
+- `.md`
+- `.markdown`
+- `.txt`
+- `.rst`
+
+Indexing behavior:
+
+- canonicalizes the requested root path before storing it
+- skips hidden files/directories
+- skips symlinks
+- skips unreadable or non-UTF-8 files
+- updates changed files in place
+- treats rename/delete as reconciliation on the next successful re-index
+
+Example:
+
+```bash
+remi docs index --root ~/notes/project-docs
+```
+
+Typical output:
+
+```text
+root=/home/alice/notes/project-docs
+indexed=42
+updated=3
+skipped=5
+deleted=1
+errors=0
+```
+
+`docs search` searches only indexed docs; it does not mix docs into `remi search query` session results.
+
+Options:
+
+- `--raw-fts`
+- `--limit <N>` (default: `20`)
+
+Examples:
+
+```bash
+remi docs search "retry budget"
+remi docs search "fts5 NEAR tokenizer" --raw-fts --limit 10
+```
+
+Output includes the doc title, relative path, and a content snippet for each hit.
 
 ---
 
@@ -485,6 +556,21 @@ Restore when needed:
 remi archive restore --bundle ~/.local/share/remi/archive/<run_id>/sessions.json
 ```
 
+### Workflow E: Index and search a docs corpus
+
+```bash
+remi docs index --root ~/docs/remi-notes
+remi docs search "retry budget"
+```
+
+If you rename or remove files under the indexed root, rerun:
+
+```bash
+remi docs index --root ~/docs/remi-notes
+```
+
+and Remi will reconcile deleted/renamed paths before the next `docs search`.
+
 ---
 
 ## Helper scripts (examples)
@@ -538,14 +624,14 @@ Use `DIARY_*` environment overrides (shown in `scripts/remi-diary.sh --help`) to
 Workspace crates:
 
 - `core-model`: canonical types + adapter trait + deterministic IDs
-- `store-sqlite`: SQLite schema, upserts, FTS index maintenance, archive planning helpers
+- `store-sqlite`: SQLite schema, session/doc upserts, FTS index maintenance, archive planning helpers
 - `ingest`: sync orchestration with progress phases
-- `search`: lexical + recency (+ optional semantic) ranking
+- `search`: session ranking plus separate docs lexical/substring search helpers
 - `archive`: plan/run/restore archive workflows
 - `adapter-common` (at `crates/adapters/common`): shared file/JSON parsing + cursor logic
 - `adapters/{pi,droid,opencode,claude,amp,codex}`: per-agent ingestion adapters
 - `embeddings` (optional): ONNX + tokenizer embedding generation
-- `cli`: `remi` command-line interface
+- `cli`: `remi` command-line interface for session sync/search, docs index/search, archive, and doctor flows
 
 ---
 
