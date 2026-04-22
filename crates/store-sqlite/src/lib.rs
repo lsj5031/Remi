@@ -1080,19 +1080,19 @@ fn build_document_snippet(content: &str, query: &str) -> String {
     if collapsed.is_ascii() && query.is_ascii() {
         let lower = collapsed.to_lowercase();
         let needle = query.trim().to_lowercase();
-        if !needle.is_empty() {
-            if let Some(start) = lower.find(&needle) {
-                let snippet_start = start.saturating_sub(60);
-                let snippet_end = (start + needle.len() + 60).min(collapsed.len());
-                let mut snippet = collapsed[snippet_start..snippet_end].to_string();
-                if snippet_start > 0 {
-                    snippet = format!("…{}", snippet.trim_start());
-                }
-                if snippet_end < collapsed.len() {
-                    snippet.push('…');
-                }
-                return snippet;
+        if !needle.is_empty()
+            && let Some(start) = lower.find(&needle)
+        {
+            let snippet_start = start.saturating_sub(60);
+            let snippet_end = (start + needle.len() + 60).min(collapsed.len());
+            let mut snippet = collapsed[snippet_start..snippet_end].to_string();
+            if snippet_start > 0 {
+                snippet = format!("…{}", snippet.trim_start());
             }
+            if snippet_end < collapsed.len() {
+                snippet.push('…');
+            }
+            return snippet;
         }
     }
     let shortened: String = collapsed.chars().take(MAX_CHARS).collect();
