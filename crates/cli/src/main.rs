@@ -1231,6 +1231,7 @@ fn detect_model_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn sanitize_title_strips_newlines() {
@@ -1268,5 +1269,50 @@ mod tests {
         assert_eq!(result.chars().count(), 81);
         assert!(result.ends_with('…'));
         assert!(!result.contains('\n'));
+    }
+
+    fn temp_path(label: &str, suffix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("remi-cli-{label}-{unique}{suffix}"))
+    }
+
+    #[test]
+    fn docs_index_round_trip_handles_rerun_and_rename() {
+        let root = temp_path("docs-root", "");
+        let db_path = temp_path("docs-db", ".sqlite");
+        fs::create_dir_all(&root).unwrap();
+        let doc_path = root.join("guide.md");
+        fs::write(&doc_path, "# Guide\n\nunique-doc-token").unwrap();
+        fs::write(root.join(".hidden.md"), "hidden").unwrap();
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&doc_path, root.join("guide-link.md")).unwrap();
+
+        let first = index_docs_root_with_db(&root, &db_path).unwrap();
+        assert_eq!(first.indexed, 1);
+        #[cfg(unix)]
+        assert!(first.skipped >= 2);
+        #[cfg(not(unix))]
+        assert!(first.skipped >= 1);
+
+        let second = index_docs_root_with_db(&root, &db_path).unwrap();
+        assert_eq!(second.indexed, 0);
+        assert_eq!(second.updated, 0);
+
+        let renamed = root.join("renamed-guide.md");
+        fs::rename(&doc_path, &renamed).unwrap();
+        let third = index_docs_root_with_db(&root, &db_path).unwrap();
+        assert_eq!(third.deleted, 1);
+        assert_eq!(third.indexed, 1);
+
+        let hits = search::search_docs_at(&db_path, "unique-doc-token", 10, false).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "renamed-guide.md");
+
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_dir_all(&root);
     }
 }
