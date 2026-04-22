@@ -519,6 +519,255 @@ impl SqliteStore {
         Ok(())
     }
 
+    pub fn begin_doc_sync(&mut self, canonical_path: &str) -> anyhow::Result<DocSyncState> {
+        let root_id = doc_root_id(canonical_path);
+        let started_at = Utc::now().to_rfc3339();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO doc_roots (root_id, canonical_path, current_generation, last_completed_generation, scan_status) VALUES (?1, ?2, 0, 0, 'idle')",
+            params![root_id.as_str(), canonical_path],
+        )?;
+        let generation: i64 = tx.query_row(
+            "SELECT current_generation + 1 FROM doc_roots WHERE root_id = ?1",
+            params![root_id.as_str()],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "UPDATE doc_roots SET current_generation = ?2, scan_started_at = ?3, scan_completed_at = NULL, scan_status = 'running' WHERE root_id = ?1",
+            params![root_id.as_str(), generation, started_at],
+        )?;
+        tx.commit()?;
+        Ok(DocSyncState {
+            root_id,
+            canonical_path: canonical_path.to_string(),
+            generation,
+        })
+    }
+
+    pub fn get_doc_root(&self, canonical_path: &str) -> anyhow::Result<Option<DocRootRecord>> {
+        self.conn
+            .query_row(
+                "SELECT root_id, canonical_path, current_generation, last_completed_generation, scan_started_at, scan_completed_at, scan_status FROM doc_roots WHERE canonical_path = ?1",
+                params![canonical_path],
+                |r| {
+                    Ok(DocRootRecord {
+                        root_id: r.get(0)?,
+                        canonical_path: r.get(1)?,
+                        current_generation: r.get(2)?,
+                        last_completed_generation: r.get(3)?,
+                        scan_started_at: parse_optional_ts(r.get(4)?),
+                        scan_completed_at: parse_optional_ts(r.get(5)?),
+                        scan_status: r.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn get_document_by_path(
+        &self,
+        root_id: &str,
+        relative_path: &str,
+    ) -> anyhow::Result<Option<DocumentRecord>> {
+        self.conn
+            .query_row(
+                "SELECT id, root_id, relative_path, title, modified_at, size_bytes, content_hash, last_seen_generation, indexed_generation, indexed_at FROM documents WHERE root_id = ?1 AND relative_path = ?2",
+                params![root_id, relative_path],
+                |r| {
+                    Ok(DocumentRecord {
+                        document_id: r.get(0)?,
+                        root_id: r.get(1)?,
+                        relative_path: r.get(2)?,
+                        title: r.get(3)?,
+                        modified_at: parse_ts(r.get(4)?),
+                        size_bytes: r.get(5)?,
+                        content_hash: r.get(6)?,
+                        last_seen_generation: r.get(7)?,
+                        indexed_generation: r.get(8)?,
+                        indexed_at: parse_ts(r.get(9)?),
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn mark_document_seen(
+        &self,
+        root_id: &str,
+        relative_path: &str,
+        generation: i64,
+    ) -> anyhow::Result<bool> {
+        let updated = self.conn.execute(
+            "UPDATE documents SET last_seen_generation = ?3 WHERE root_id = ?1 AND relative_path = ?2",
+            params![root_id, relative_path, generation],
+        )?;
+        Ok(updated > 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_document(
+        &mut self,
+        root_id: &str,
+        relative_path: &str,
+        title: &str,
+        modified_at: DateTime<Utc>,
+        size_bytes: i64,
+        content_hash: &str,
+        content: &str,
+        generation: i64,
+    ) -> anyhow::Result<String> {
+        let document_id = document_id(root_id, relative_path);
+        let indexed_at = Utc::now().to_rfc3339();
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            r#"INSERT INTO documents (id, root_id, relative_path, title, modified_at, size_bytes, content_hash, last_seen_generation, indexed_generation, indexed_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)
+            ON CONFLICT(root_id, relative_path) DO UPDATE SET
+              id=excluded.id,
+              title=excluded.title,
+              modified_at=excluded.modified_at,
+              size_bytes=excluded.size_bytes,
+              content_hash=excluded.content_hash,
+              last_seen_generation=excluded.last_seen_generation,
+              indexed_generation=excluded.indexed_generation,
+              indexed_at=excluded.indexed_at"#,
+            params![
+                document_id.as_str(),
+                root_id,
+                relative_path,
+                title,
+                modified_at.to_rfc3339(),
+                size_bytes,
+                content_hash,
+                generation,
+                indexed_at,
+            ],
+        )?;
+        let rowid: i64 = tx.query_row(
+            "SELECT rowid FROM documents WHERE root_id = ?1 AND relative_path = ?2",
+            params![root_id, relative_path],
+            |r| r.get(0),
+        )?;
+        tx.execute("DELETE FROM fts_documents WHERE rowid = ?1", params![rowid])?;
+        tx.execute(
+            "INSERT INTO fts_documents (rowid, document_id, root_id, path, title, content) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![rowid, document_id.as_str(), root_id, relative_path, title, content],
+        )?;
+        tx.commit()?;
+        Ok(document_id)
+    }
+
+    pub fn finalize_doc_sync(
+        &mut self,
+        root_id: &str,
+        generation: i64,
+    ) -> anyhow::Result<DocFinalizeResult> {
+        let completed_at = Utc::now().to_rfc3339();
+        let tx = self.conn.transaction()?;
+        let current_generation: Option<i64> = tx
+            .query_row(
+                "SELECT current_generation FROM doc_roots WHERE root_id = ?1",
+                params![root_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let current_generation = current_generation.with_context(|| {
+            format!("doc root {root_id} missing while finalizing generation {generation}")
+        })?;
+        if current_generation != generation {
+            return Err(anyhow::anyhow!(
+                "stale doc sync finalize for root {root_id}: current generation {current_generation}, attempted {generation}"
+            ));
+        }
+        let deleted_documents: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM documents WHERE root_id = ?1 AND last_seen_generation < ?2",
+            params![root_id, generation],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "DELETE FROM fts_documents WHERE rowid IN (SELECT rowid FROM documents WHERE root_id = ?1 AND last_seen_generation < ?2)",
+            params![root_id, generation],
+        )?;
+        tx.execute(
+            "DELETE FROM documents WHERE root_id = ?1 AND last_seen_generation < ?2",
+            params![root_id, generation],
+        )?;
+        tx.execute(
+            "UPDATE doc_roots SET last_completed_generation = ?2, scan_status = 'completed', scan_completed_at = ?3 WHERE root_id = ?1",
+            params![root_id, generation, completed_at],
+        )?;
+        tx.commit()?;
+        Ok(DocFinalizeResult {
+            deleted_documents: deleted_documents as usize,
+        })
+    }
+
+    pub fn fail_doc_sync(&self, root_id: &str, generation: i64) -> anyhow::Result<()> {
+        let updated = self.conn.execute(
+            "UPDATE doc_roots SET scan_status = 'failed', scan_completed_at = ?3 WHERE root_id = ?1 AND current_generation = ?2",
+            params![root_id, generation, Utc::now().to_rfc3339()],
+        )?;
+        if updated == 0 {
+            return Err(anyhow::anyhow!(
+                "doc root {root_id} missing or generation {generation} is no longer current"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn search_documents_lexical(
+        &self,
+        query: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<DocumentSearchRow>> {
+        debug!(query, limit, "docs lexical search");
+        let mut stmt = self.conn.prepare(
+            "SELECT d.id, d.root_id, dr.canonical_path, d.relative_path, d.title, snippet(fts_documents, 4, '[', ']', ' … ', 16), bm25(fts_documents) AS rank FROM fts_documents INNER JOIN documents d ON d.rowid = fts_documents.rowid INNER JOIN doc_roots dr ON dr.root_id = d.root_id WHERE fts_documents MATCH ?1 ORDER BY rank LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![query, limit], |r| {
+            let rank: f64 = r.get(6)?;
+            Ok(DocumentSearchRow {
+                document_id: r.get(0)?,
+                root_id: r.get(1)?,
+                root_path: r.get(2)?,
+                relative_path: r.get(3)?,
+                title: r.get(4)?,
+                snippet: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                score: -rank,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn search_documents_substring(
+        &self,
+        query: &str,
+        limit: i64,
+    ) -> anyhow::Result<Vec<DocumentSearchRow>> {
+        debug!(query, limit, "docs substring search");
+        let pattern = format!("%{}%", escape_like_pattern(&query.to_lowercase()));
+        let mut stmt = self.conn.prepare(
+            "SELECT d.id, d.root_id, dr.canonical_path, d.relative_path, d.title, f.content FROM documents d INNER JOIN doc_roots dr ON dr.root_id = d.root_id INNER JOIN fts_documents f ON f.rowid = d.rowid WHERE lower(f.content) LIKE ?1 ESCAPE '\\' ORDER BY d.indexed_at DESC, d.relative_path ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![pattern, limit], |r| {
+            let content: String = r.get(5)?;
+            Ok(DocumentSearchRow {
+                document_id: r.get(0)?,
+                root_id: r.get(1)?,
+                root_path: r.get(2)?,
+                relative_path: r.get(3)?,
+                title: r.get(4)?,
+                snippet: build_document_snippet(&content, query),
+                score: 0.0,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn list_sessions(&self) -> anyhow::Result<Vec<Session>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, agent, source_ref, title, created_at, updated_at FROM sessions ORDER BY updated_at DESC",
