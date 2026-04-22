@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Context;
@@ -305,8 +305,20 @@ fn search_docs_conn(
                 score: (-rank) as f32,
             })
         })?;
-        let hits = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut hits = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         if !hits.is_empty() {
+            if hits.len() >= limit {
+                return Ok(hits);
+            }
+            let mut seen_paths: HashSet<String> = hits.iter().map(|hit| hit.path.clone()).collect();
+            for hit in substring_doc_hits(conn, query, limit)? {
+                if seen_paths.insert(hit.path.clone()) {
+                    hits.push(hit);
+                    if hits.len() >= limit {
+                        break;
+                    }
+                }
+            }
             return Ok(hits);
         }
     }
@@ -315,6 +327,10 @@ fn search_docs_conn(
         return Ok(Vec::new());
     }
 
+    substring_doc_hits(conn, query, limit)
+}
+
+fn substring_doc_hits(conn: &Connection, query: &str, limit: usize) -> anyhow::Result<Vec<DocHit>> {
     let pattern = format!("%{}%", escape_like_pattern(&query.to_lowercase()));
     let mut stmt = conn.prepare(
         "SELECT path,
@@ -614,6 +630,49 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "guides/setup.md");
         assert!(hits[0].snippet.to_lowercase().contains("docs-search"));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn docs_search_backfills_partial_fts_matches_with_substring_hits() {
+        let db_path = temp_db_path("docs-partial-fts");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE VIRTUAL TABLE fts_documents USING fts5(
+              document_id UNINDEXED,
+              root_id UNINDEXED,
+              path,
+              title,
+              content,
+              tokenize = 'unicode61 tokenchars ''_./:-'''
+            );
+            INSERT INTO fts_documents (document_id, root_id, path, title, content) VALUES
+              ('doc-1', 'root-1', 'guides/guide.md', 'Guide', 'unique-doc-token lives here'),
+              ('doc-2', 'root-1', 'guides/notes.markdown', 'Notes', 'Nested note with unique-doc-token.'),
+              ('doc-3', 'root-1', 'guides/reference.rst', 'Reference', 'unique-doc-token');
+            "#,
+        )
+        .unwrap();
+
+        let hits = search_docs_conn(&conn, "unique-doc-token", 10, false).unwrap();
+        let paths = hits.iter().map(|hit| hit.path.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec![
+                "guides/reference.rst",
+                "guides/guide.md",
+                "guides/notes.markdown",
+            ]
+        );
+        assert!(
+            hits.iter()
+                .find(|hit| hit.path == "guides/notes.markdown")
+                .unwrap()
+                .snippet
+                .contains("unique-doc-token")
+        );
 
         let _ = std::fs::remove_file(db_path);
     }

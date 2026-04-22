@@ -143,7 +143,6 @@ fn search_query_empty_db_still_exits_cleanly() {
 }
 
 #[test]
-#[ignore = "enable after worker-1/worker-2 docs index/search implementation lands in this worktree"]
 fn docs_index_search_allowlist_and_regressions() {
     let data_home = fresh_data_home();
     let docs_root = data_home.join("docs-root");

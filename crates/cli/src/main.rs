@@ -680,9 +680,9 @@ fn index_docs_root_with_db(root: &Path, db_path: &Path) -> anyhow::Result<DocsIn
     for doc in &scan.docs {
         let existing: Option<(String, i64, String)> = tx
             .query_row(
-                "SELECT modified_at, size, content_hash
+                "SELECT modified_at, size_bytes, content_hash
                  FROM documents
-                 WHERE root_id = ?1 AND path = ?2",
+                 WHERE root_id = ?1 AND relative_path = ?2",
                 params![root_id, doc.relative_path],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -699,9 +699,9 @@ fn index_docs_root_with_db(root: &Path, db_path: &Path) -> anyhow::Result<DocsIn
             tx.execute(
                 "UPDATE documents
                  SET last_seen_generation = ?3,
-                     completed_generation = ?3,
+                     indexed_generation = ?3,
                      indexed_at = ?4
-                 WHERE root_id = ?1 AND path = ?2",
+                 WHERE root_id = ?1 AND relative_path = ?2",
                 params![root_id, doc.relative_path, generation, now],
             )?;
             continue;
@@ -715,17 +715,17 @@ fn index_docs_root_with_db(root: &Path, db_path: &Path) -> anyhow::Result<DocsIn
 
         tx.execute(
             "INSERT INTO documents
-                (id, root_id, path, title, modified_at, size, content_hash,
-                 last_seen_generation, completed_generation, indexed_at)
+                (id, root_id, relative_path, title, modified_at, size_bytes, content_hash,
+                 last_seen_generation, indexed_generation, indexed_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)
-             ON CONFLICT(root_id, path) DO UPDATE SET
+             ON CONFLICT(root_id, relative_path) DO UPDATE SET
                 id = excluded.id,
                 title = excluded.title,
                 modified_at = excluded.modified_at,
-                size = excluded.size,
+                size_bytes = excluded.size_bytes,
                 content_hash = excluded.content_hash,
                 last_seen_generation = excluded.last_seen_generation,
-                completed_generation = excluded.completed_generation,
+                indexed_generation = excluded.indexed_generation,
                 indexed_at = excluded.indexed_at",
             params![
                 doc.document_id,
@@ -775,11 +775,10 @@ fn index_docs_root_with_db(root: &Path, db_path: &Path) -> anyhow::Result<DocsIn
     }
     tx.execute(
         "UPDATE doc_roots
-         SET generation = ?2,
-             scan_started_at = ?3,
+         SET last_completed_generation = ?2,
              scan_completed_at = ?3,
-             scan_status = 'ready'
-         WHERE root_id = ?1",
+             scan_status = 'completed'
+         WHERE root_id = ?1 AND current_generation = ?2",
         params![root_id, generation, now],
     )?;
     tx.commit()?;
@@ -900,7 +899,8 @@ fn ensure_docs_schema(conn: &Connection) -> anyhow::Result<()> {
         CREATE TABLE IF NOT EXISTS doc_roots (
           root_id TEXT PRIMARY KEY,
           canonical_path TEXT NOT NULL UNIQUE,
-          generation INTEGER NOT NULL DEFAULT 0,
+          current_generation INTEGER NOT NULL DEFAULT 0,
+          last_completed_generation INTEGER NOT NULL DEFAULT 0,
           scan_started_at TEXT,
           scan_completed_at TEXT,
           scan_status TEXT NOT NULL DEFAULT 'idle'
@@ -908,15 +908,15 @@ fn ensure_docs_schema(conn: &Connection) -> anyhow::Result<()> {
         CREATE TABLE IF NOT EXISTS documents (
           id TEXT PRIMARY KEY,
           root_id TEXT NOT NULL,
-          path TEXT NOT NULL,
+          relative_path TEXT NOT NULL,
           title TEXT NOT NULL,
           modified_at TEXT NOT NULL,
-          size INTEGER NOT NULL,
+          size_bytes INTEGER NOT NULL,
           content_hash TEXT NOT NULL,
           last_seen_generation INTEGER NOT NULL,
-          completed_generation INTEGER NOT NULL,
+          indexed_generation INTEGER NOT NULL,
           indexed_at TEXT NOT NULL,
-          UNIQUE(root_id, path),
+          UNIQUE(root_id, relative_path),
           FOREIGN KEY(root_id) REFERENCES doc_roots(root_id) ON DELETE CASCADE
         );
         CREATE VIRTUAL TABLE IF NOT EXISTS fts_documents USING fts5(
@@ -927,7 +927,8 @@ fn ensure_docs_schema(conn: &Connection) -> anyhow::Result<()> {
           content,
           tokenize = 'unicode61 tokenchars ''_./:-'''
         );
-        CREATE INDEX IF NOT EXISTS idx_documents_root_path ON documents(root_id, path);
+        CREATE INDEX IF NOT EXISTS idx_documents_root_id ON documents(root_id);
+        CREATE INDEX IF NOT EXISTS idx_documents_root_generation ON documents(root_id, last_seen_generation);
         "#,
     )?;
     Ok(())
@@ -941,7 +942,7 @@ fn reserve_generation(
 ) -> anyhow::Result<i64> {
     let previous_generation: i64 = conn
         .query_row(
-            "SELECT generation FROM doc_roots WHERE root_id = ?1",
+            "SELECT current_generation FROM doc_roots WHERE root_id = ?1",
             params![root_id],
             |row| row.get(0),
         )
@@ -950,11 +951,11 @@ fn reserve_generation(
     let generation = previous_generation + 1;
     conn.execute(
         "INSERT INTO doc_roots
-            (root_id, canonical_path, generation, scan_started_at, scan_completed_at, scan_status)
+            (root_id, canonical_path, current_generation, scan_started_at, scan_completed_at, scan_status)
          VALUES (?1, ?2, ?3, ?4, NULL, 'running')
          ON CONFLICT(root_id) DO UPDATE SET
             canonical_path = excluded.canonical_path,
-            generation = excluded.generation,
+            current_generation = excluded.current_generation,
             scan_started_at = excluded.scan_started_at,
             scan_completed_at = NULL,
             scan_status = excluded.scan_status",
