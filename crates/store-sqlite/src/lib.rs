@@ -1059,6 +1059,51 @@ fn parse_ts(ts: String) -> DateTime<Utc> {
         .unwrap_or_else(|_| Utc::now())
 }
 
+fn parse_optional_ts(ts: Option<String>) -> Option<DateTime<Utc>> {
+    ts.map(parse_ts)
+}
+
+fn doc_root_id(canonical_path: &str) -> String {
+    deterministic_id(&["doc_root", canonical_path])
+}
+
+fn document_id(root_id: &str, relative_path: &str) -> String {
+    deterministic_id(&["document", root_id, relative_path])
+}
+
+fn build_document_snippet(content: &str, query: &str) -> String {
+    const MAX_CHARS: usize = 180;
+    let collapsed = content.split_whitespace().collect::<Vec<_>>().join(" "
+    );
+    if collapsed.is_empty() {
+        return String::new();
+    }
+    if collapsed.is_ascii() && query.is_ascii() {
+        let lower = collapsed.to_lowercase();
+        let needle = query.trim().to_lowercase();
+        if !needle.is_empty() {
+            if let Some(start) = lower.find(&needle) {
+                let snippet_start = start.saturating_sub(60);
+                let snippet_end = (start + needle.len() + 60).min(collapsed.len());
+                let mut snippet = collapsed[snippet_start..snippet_end].to_string();
+                if snippet_start > 0 {
+                    snippet = format!("…{}", snippet.trim_start());
+                }
+                if snippet_end < collapsed.len() {
+                    snippet.push('…');
+                }
+                return snippet;
+            }
+        }
+    }
+    let shortened: String = collapsed.chars().take(MAX_CHARS).collect();
+    if shortened.len() == collapsed.len() {
+        shortened
+    } else {
+        format!("{shortened}…")
+    }
+}
+
 fn parse_agent(s: &str) -> rusqlite::Result<core_model::AgentKind> {
     s.parse::<core_model::AgentKind>().map_err(|err| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -1130,6 +1175,28 @@ mod tests {
                 source_id: "src-1".to_string(),
             }],
         }
+    }
+
+    fn upsert_test_document(
+        store: &mut SqliteStore,
+        sync: &DocSyncState,
+        relative_path: &str,
+        title: &str,
+        content: &str,
+    ) {
+        let modified_at = Utc::now();
+        store
+            .upsert_document(
+                &sync.root_id,
+                relative_path,
+                title,
+                modified_at,
+                content.len() as i64,
+                &format!("hash-{relative_path}-{}", content.len()),
+                content,
+                sync.generation,
+            )
+            .unwrap();
     }
 
     #[test]
