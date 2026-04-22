@@ -624,6 +624,398 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DocsIndexSummary {
+    indexed: usize,
+    updated: usize,
+    skipped: usize,
+    deleted: usize,
+    errors: usize,
+}
+
+#[derive(Debug)]
+struct ScannedDoc {
+    document_id: String,
+    relative_path: String,
+    title: String,
+    modified_at: String,
+    size: i64,
+    content_hash: String,
+    content: String,
+}
+
+fn index_docs_root(root: &Path) -> anyhow::Result<DocsIndexSummary> {
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("canonicalizing root {}", root.display()))?;
+    if !canonical_root.is_dir() {
+        bail!("docs root is not a directory: {}", canonical_root.display());
+    }
+
+    let db_path = default_db_path();
+    if let Some(parent) = db_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent dir for {}", db_path.display()))?;
+    }
+    let mut conn = Connection::open(&db_path)
+        .with_context(|| format!("opening sqlite db {}", db_path.display()))?;
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
+    )?;
+    ensure_docs_schema(&conn)?;
+
+    let now = chrono::Utc::now().to_rfc3339();
+    let root_key = canonical_root.to_string_lossy().to_string();
+    let root_id = stable_id("doc-root", &[&root_key]);
+    let generation = reserve_generation(&conn, &root_id, &root_key, &now)?;
+    let scan = scan_docs_tree(&canonical_root, &root_id)?;
+
+    let tx = conn.transaction()?;
+    let mut deleted = 0usize;
+    for doc in &scan.docs {
+        let existing: Option<(String, i64, String)> = tx
+            .query_row(
+                "SELECT modified_at, size, content_hash
+                 FROM documents
+                 WHERE root_id = ?1 AND path = ?2",
+                params![root_id, doc.relative_path],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+
+        let unchanged = existing.as_ref().is_some_and(|(modified_at, size, content_hash)| {
+            modified_at == &doc.modified_at && *size == doc.size && content_hash == &doc.content_hash
+        });
+        if unchanged {
+            tx.execute(
+                "UPDATE documents
+                 SET last_seen_generation = ?3,
+                     completed_generation = ?3,
+                     indexed_at = ?4
+                 WHERE root_id = ?1 AND path = ?2",
+                params![root_id, doc.relative_path, generation, now],
+            )?;
+            continue;
+        }
+
+        tx.execute(
+            "INSERT INTO documents
+                (id, root_id, path, title, modified_at, size, content_hash,
+                 last_seen_generation, completed_generation, indexed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)
+             ON CONFLICT(root_id, path) DO UPDATE SET
+                id = excluded.id,
+                title = excluded.title,
+                modified_at = excluded.modified_at,
+                size = excluded.size,
+                content_hash = excluded.content_hash,
+                last_seen_generation = excluded.last_seen_generation,
+                completed_generation = excluded.completed_generation,
+                indexed_at = excluded.indexed_at",
+            params![
+                doc.document_id,
+                root_id,
+                doc.relative_path,
+                doc.title,
+                doc.modified_at,
+                doc.size,
+                doc.content_hash,
+                generation,
+                now,
+            ],
+        )?;
+        tx.execute(
+            "DELETE FROM fts_documents WHERE document_id = ?1",
+            params![doc.document_id],
+        )?;
+        tx.execute(
+            "INSERT INTO fts_documents (document_id, root_id, path, title, content)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                doc.document_id,
+                root_id,
+                doc.relative_path,
+                doc.title,
+                doc.content
+            ],
+        )?;
+
+        if existing.is_some() {
+            deleted += 0;
+        }
+    }
+
+    let stale_ids: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT id
+             FROM documents
+             WHERE root_id = ?1 AND last_seen_generation <> ?2",
+        )?;
+        let rows = stmt.query_map(params![root_id, generation], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    deleted = stale_ids.len();
+    for stale_id in &stale_ids {
+        tx.execute(
+            "DELETE FROM fts_documents WHERE document_id = ?1",
+            params![stale_id],
+        )?;
+        tx.execute("DELETE FROM documents WHERE id = ?1", params![stale_id])?;
+    }
+    tx.execute(
+        "UPDATE doc_roots
+         SET generation = ?2,
+             scan_started_at = ?3,
+             scan_completed_at = ?3,
+             scan_status = 'ready'
+         WHERE root_id = ?1",
+        params![root_id, generation, now],
+    )?;
+    tx.commit()?;
+
+    Ok(DocsIndexSummary {
+        indexed: scan.indexed,
+        updated: scan.updated,
+        skipped: scan.skipped,
+        deleted,
+        errors: scan.errors,
+    })
+}
+
+struct DocsScan {
+    docs: Vec<ScannedDoc>,
+    indexed: usize,
+    updated: usize,
+    skipped: usize,
+    errors: usize,
+}
+
+fn scan_docs_tree(root: &Path, root_id: &str) -> anyhow::Result<DocsScan> {
+    let mut docs = Vec::new();
+    let mut indexed = 0usize;
+    let mut skipped = 0usize;
+    let mut errors = 0usize;
+    let mut stack = vec![root.to_path_buf()];
+
+    while let Some(dir) = stack.pop() {
+        let entries = fs::read_dir(&dir)
+            .with_context(|| format!("reading directory {}", dir.display()))?;
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => {
+                    errors += 1;
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let file_name = entry.file_name();
+            if is_hidden_name(&file_name) {
+                skipped += 1;
+                continue;
+            }
+
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => {
+                    errors += 1;
+                    continue;
+                }
+            };
+            if file_type.is_symlink() {
+                skipped += 1;
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() || !is_supported_doc(&path) {
+                skipped += 1;
+                continue;
+            }
+
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    errors += 1;
+                    continue;
+                }
+            };
+            let bytes = match fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    errors += 1;
+                    continue;
+                }
+            };
+            let content = match String::from_utf8(bytes) {
+                Ok(content) => content,
+                Err(_) => {
+                    errors += 1;
+                    continue;
+                }
+            };
+            let relative_path = normalize_relative_path(root, &path)?;
+            let title = doc_title(&path, &content);
+            let modified_at = metadata
+                .modified()
+                .ok()
+                .and_then(|ts| ts.duration_since(UNIX_EPOCH).ok())
+                .map(|ts| ts.as_secs().to_string())
+                .unwrap_or_else(|| "0".to_string());
+            let content_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+            docs.push(ScannedDoc {
+                document_id: stable_id("doc", &[root_id, &relative_path]),
+                relative_path,
+                title,
+                modified_at,
+                size: metadata.len() as i64,
+                content_hash,
+                content,
+            });
+            indexed += 1;
+        }
+    }
+
+    docs.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+
+    Ok(DocsScan {
+        updated: indexed,
+        indexed,
+        docs,
+        skipped,
+        errors,
+    })
+}
+
+fn ensure_docs_schema(conn: &Connection) -> anyhow::Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS doc_roots (
+          root_id TEXT PRIMARY KEY,
+          canonical_path TEXT NOT NULL UNIQUE,
+          generation INTEGER NOT NULL DEFAULT 0,
+          scan_started_at TEXT,
+          scan_completed_at TEXT,
+          scan_status TEXT NOT NULL DEFAULT 'idle'
+        );
+        CREATE TABLE IF NOT EXISTS documents (
+          id TEXT PRIMARY KEY,
+          root_id TEXT NOT NULL,
+          path TEXT NOT NULL,
+          title TEXT NOT NULL,
+          modified_at TEXT NOT NULL,
+          size INTEGER NOT NULL,
+          content_hash TEXT NOT NULL,
+          last_seen_generation INTEGER NOT NULL,
+          completed_generation INTEGER NOT NULL,
+          indexed_at TEXT NOT NULL,
+          UNIQUE(root_id, path),
+          FOREIGN KEY(root_id) REFERENCES doc_roots(root_id) ON DELETE CASCADE
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS fts_documents USING fts5(
+          document_id UNINDEXED,
+          root_id UNINDEXED,
+          path,
+          title,
+          content,
+          tokenize = 'unicode61 tokenchars ''_./:-'''
+        );
+        CREATE INDEX IF NOT EXISTS idx_documents_root_path ON documents(root_id, path);
+        "#,
+    )?;
+    Ok(())
+}
+
+fn reserve_generation(
+    conn: &Connection,
+    root_id: &str,
+    canonical_path: &str,
+    now: &str,
+) -> anyhow::Result<i64> {
+    let previous_generation: i64 = conn
+        .query_row(
+            "SELECT generation FROM doc_roots WHERE root_id = ?1",
+            params![root_id],
+            |row| row.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    let generation = previous_generation + 1;
+    conn.execute(
+        "INSERT INTO doc_roots
+            (root_id, canonical_path, generation, scan_started_at, scan_completed_at, scan_status)
+         VALUES (?1, ?2, ?3, ?4, NULL, 'running')
+         ON CONFLICT(root_id) DO UPDATE SET
+            canonical_path = excluded.canonical_path,
+            generation = excluded.generation,
+            scan_started_at = excluded.scan_started_at,
+            scan_completed_at = NULL,
+            scan_status = excluded.scan_status",
+        params![root_id, canonical_path, generation, now],
+    )?;
+    Ok(generation)
+}
+
+fn default_db_path() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("remi")
+        .join("remi.db")
+}
+
+fn normalize_relative_path(root: &Path, path: &Path) -> anyhow::Result<String> {
+    let rel = path
+        .strip_prefix(root)
+        .with_context(|| format!("computing relative path for {}", path.display()))?;
+    let parts = rel
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    Ok(parts.join("/"))
+}
+
+fn is_supported_doc(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("md" | "markdown" | "txt" | "rst")
+    )
+}
+
+fn is_hidden_name(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| name.starts_with('.'))
+}
+
+fn doc_title(path: &Path, content: &str) -> String {
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if let Some(title) = trimmed.strip_prefix("# ") {
+            if !title.trim().is_empty() {
+                return title.trim().to_string();
+            }
+        }
+    }
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .map(|stem| stem.to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn stable_id(prefix: &str, parts: &[&str]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(prefix.as_bytes());
+    for part in parts {
+        hasher.update(&[0]);
+        hasher.update(part.as_bytes());
+    }
+    format!("{prefix}-{}", hasher.finalize().to_hex())
+}
+
 #[cfg(feature = "semantic")]
 fn configure_ort(cli: &Cli) -> anyhow::Result<()> {
     if let Some(path) = &cli.ort_dylib_path {
