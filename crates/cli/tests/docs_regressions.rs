@@ -2,11 +2,13 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use core_model::{AgentKind, Message, NormalizedBatch, Session};
+use rusqlite::Connection;
 use serde_json::Value;
 use store_sqlite::SqliteStore;
 
@@ -217,4 +219,69 @@ fn docs_index_search_allowlist_and_regressions() {
 
     let doctor = remi_cmd(&data_home).arg("doctor").output().unwrap();
     assert!(doctor.status.success());
+}
+
+#[test]
+fn docs_index_updates_stay_store_searchable_and_write_rfc3339_timestamps() {
+    let data_home = fresh_data_home();
+    let docs_root = data_home.join("docs-contract-root");
+    fs::create_dir_all(&docs_root).unwrap();
+    let doc_path = docs_root.join("one.md");
+    fs::write(&doc_path, "# One\n\nalpha token\n").unwrap();
+
+    let first = remi_cmd(&data_home)
+        .args(["docs", "index", "--root", docs_root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "first docs index failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    thread::sleep(Duration::from_secs(1));
+    fs::write(&doc_path, "# One\n\nalpha token updated\n").unwrap();
+
+    let second = remi_cmd(&data_home)
+        .args(["docs", "index", "--root", docs_root.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "second docs index failed:\nstdout={}\nstderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let db_path = data_home.join("remi").join("remi.db");
+    let store = SqliteStore::open(&db_path).unwrap();
+    let hits = store.search_documents_lexical("alpha", 10).unwrap();
+    assert_eq!(hits.len(), 1, "hits={hits:?}");
+    assert_eq!(hits[0].relative_path, "one.md");
+    assert!(hits[0].snippet.contains("alpha"), "hits={hits:?}");
+
+    let canonical_root = docs_root.canonicalize().unwrap();
+    let root = store
+        .get_doc_root(canonical_root.to_str().unwrap())
+        .unwrap()
+        .unwrap();
+    let doc = store
+        .get_document_by_path(&root.root_id, "one.md")
+        .unwrap()
+        .unwrap();
+    assert_eq!(doc.title, "One");
+
+    let conn = Connection::open(&db_path).unwrap();
+    let modified_at: String = conn
+        .query_row(
+            "SELECT modified_at FROM documents WHERE root_id = ?1 AND relative_path = ?2",
+            [&root.root_id, "one.md"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        DateTime::parse_from_rfc3339(&modified_at).is_ok(),
+        "modified_at={modified_at}"
+    );
 }

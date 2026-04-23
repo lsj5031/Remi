@@ -10,8 +10,6 @@ use tracing::debug;
 
 pub struct PiAdapter;
 
-const PI_CURSOR_PREFIX: &str = "pi-v2|";
-
 impl AgentAdapter for PiAdapter {
     fn kind(&self) -> AgentKind {
         AgentKind::Pi
@@ -46,7 +44,6 @@ impl AgentAdapter for PiAdapter {
 
     fn checkpoint_cursor(&self, records: &[NativeRecord]) -> Option<String> {
         adapter_common::checkpoint_cursor_from_records(records)
-            .map(|cursor| format!("{PI_CURSOR_PREFIX}{cursor}"))
     }
 
     fn archive_capability(&self) -> ArchiveCapability {
@@ -58,6 +55,14 @@ fn parse_rfc3339(input: &str) -> Option<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(input)
         .ok()
         .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn format_pi_source_id(session_id: &str, msg_index: usize, tool_result_id: Option<&str>) -> String {
+    let ordinal = format!("{msg_index:020}");
+    match tool_result_id {
+        Some(tool_result_id) => format!("{session_id}:{ordinal}:toolResult:{tool_result_id}"),
+        None => format!("{session_id}:{ordinal}"),
+    }
 }
 
 fn extract_text_only(content: Option<&Value>) -> String {
@@ -155,9 +160,7 @@ fn load_pi_jsonl(
     source_paths: &[String],
     cursor: Option<&str>,
 ) -> anyhow::Result<Vec<NativeRecord>> {
-    let parsed_cursor = cursor
-        .and_then(|cursor| cursor.strip_prefix(PI_CURSOR_PREFIX))
-        .and_then(adapter_common::parse_cursor);
+    let parsed_cursor = cursor.and_then(adapter_common::parse_cursor);
     let mut out: Vec<NativeRecord> = source_paths
         .par_iter()
         .flat_map(|path| {
@@ -184,7 +187,7 @@ fn load_pi_jsonl(
             let mut cwd: Option<String> = None;
             let mut first_user_text: Option<String> = None;
             let mut records = Vec::new();
-            let mut visible_msg_index = 0usize;
+            let mut msg_index = 0usize;
 
             for line in &lines {
                 let trimmed = line.trim();
@@ -244,19 +247,16 @@ fn load_pi_jsonl(
                         } else {
                             session_id.clone()
                         };
-                        let source_id = if role == "toolResult" {
-                            let tool_result_id = val
-                                .get("id")
+                        let tool_result_id = (role == "toolResult").then(|| {
+                            val.get("id")
                                 .and_then(Value::as_str)
                                 .filter(|id| !id.is_empty())
                                 .map(ToOwned::to_owned)
-                                .unwrap_or_else(|| deterministic_id(&[path, trimmed]));
-                            format!("{sid}:toolResult:{tool_result_id}")
-                        } else {
-                            let source_id = format!("{sid}:{visible_msg_index}");
-                            visible_msg_index += 1;
-                            source_id
-                        };
+                                .unwrap_or_else(|| deterministic_id(&[path, trimmed]))
+                        });
+                        let source_id =
+                            format_pi_source_id(&sid, msg_index, tool_result_id.as_deref());
+                        msg_index += 1;
 
                         if let Some(ref cur) = parsed_cursor
                             && adapter_common::should_skip(line_ts, &source_id, cur)
@@ -452,8 +452,8 @@ mod tests {
         );
         let records = load_pi_jsonl(&[path], None).unwrap();
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].source_id, "sess-pi-1:0");
-        assert_eq!(records[1].source_id, "sess-pi-1:1");
+        assert_eq!(records[0].source_id, "sess-pi-1:00000000000000000000");
+        assert_eq!(records[1].source_id, "sess-pi-1:00000000000000000001");
         assert_eq!(
             records[0].payload.get("role").unwrap().as_str().unwrap(),
             "user"
@@ -510,10 +510,10 @@ mod tests {
         assert_eq!(
             source_ids,
             vec![
-                "sess-pi-2:0",
-                "sess-pi-2:1",
-                "sess-pi-2:toolResult:m3",
-                "sess-pi-2:2",
+                "sess-pi-2:00000000000000000000",
+                "sess-pi-2:00000000000000000001",
+                "sess-pi-2:00000000000000000002:toolResult:m3",
+                "sess-pi-2:00000000000000000003",
             ]
         );
         let roles: Vec<&str> = records
@@ -554,7 +554,7 @@ mod tests {
             .with_timezone(&Utc);
         let records = vec![
             NativeRecord {
-                source_id: "sess-pi-1:0".to_string(),
+                source_id: "sess-pi-1:00000000000000000000".to_string(),
                 updated_at: ts1,
                 payload: serde_json::json!({
                     "role": "user",
@@ -567,7 +567,7 @@ mod tests {
                 }),
             },
             NativeRecord {
-                source_id: "sess-pi-1:1".to_string(),
+                source_id: "sess-pi-1:00000000000000000001".to_string(),
                 updated_at: ts2,
                 payload: serde_json::json!({
                     "role": "assistant",
@@ -596,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn ignores_legacy_checkpoint_format_for_full_rescan() {
+    fn legacy_checkpoint_ids_force_full_rescan_after_source_id_change() {
         let dir = tempdir();
         let path = write_session(
             &dir,
@@ -610,11 +610,11 @@ mod tests {
         let records = load_pi_jsonl(&[path], Some(legacy_cursor)).unwrap();
 
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].source_id, "sess-pi-3:0");
+        assert_eq!(records[0].source_id, "sess-pi-3:00000000000000000000");
     }
 
     #[test]
-    fn versioned_checkpoint_still_filters_seen_records() {
+    fn checkpoint_filters_seen_records() {
         let dir = tempdir();
         let path = write_session(
             &dir,
@@ -625,10 +625,46 @@ mod tests {
             ],
         );
 
-        let cursor = format!("{PI_CURSOR_PREFIX}2026-02-08T10:55:00+00:00\x1fsess-pi-4:0");
-        let records = load_pi_jsonl(&[path], Some(&cursor)).unwrap();
+        let cursor = "2026-02-08T10:55:00+00:00\x1fsess-pi-4:00000000000000000000";
+        let records = load_pi_jsonl(&[path], Some(cursor)).unwrap();
 
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].source_id, "sess-pi-4:1");
+        assert_eq!(records[0].source_id, "sess-pi-4:00000000000000000001");
+    }
+
+    #[test]
+    fn checkpoint_keeps_same_timestamp_messages_after_tool_result() {
+        let dir = tempdir();
+        let path = write_session(
+            &dir,
+            &[
+                r#"{"type":"session","version":3,"id":"sess-pi-5","timestamp":"2026-02-08T10:54:12.530Z","cwd":"/tmp"}"#,
+                r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-02-08T10:55:00.000Z","message":{"role":"user","content":[{"type":"text","text":"run tests"}]}}"#,
+                r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-02-08T10:55:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Running tests now"},{"type":"toolCall","id":"call_xxx","name":"bash","arguments":{"command":"cargo test"}}]}}"#,
+                r#"{"type":"message","id":"m3","parentId":"m2","timestamp":"2026-02-08T10:55:00.000Z","message":{"role":"toolResult","toolCallId":"call_xxx","toolName":"bash","content":[{"type":"text","text":"all tests passed"}]}}"#,
+                r#"{"type":"message","id":"m4","parentId":"m3","timestamp":"2026-02-08T10:55:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"All tests passed!"}]}}"#,
+            ],
+        );
+
+        let records = load_pi_jsonl(std::slice::from_ref(&path), None).unwrap();
+        let source_ids: Vec<&str> = records
+            .iter()
+            .map(|record| record.source_id.as_str())
+            .collect();
+        assert_eq!(
+            source_ids,
+            vec![
+                "sess-pi-5:00000000000000000000",
+                "sess-pi-5:00000000000000000001",
+                "sess-pi-5:00000000000000000002:toolResult:m3",
+                "sess-pi-5:00000000000000000003",
+            ]
+        );
+
+        let cursor = "2026-02-08T10:55:00+00:00\x1fsess-pi-5:00000000000000000002:toolResult:m3";
+        let records = load_pi_jsonl(&[path], Some(cursor)).unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source_id, "sess-pi-5:00000000000000000003");
     }
 }

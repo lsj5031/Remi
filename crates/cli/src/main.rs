@@ -2,14 +2,14 @@ use std::{
     cell::RefCell,
     fs,
     path::{Path, PathBuf},
-    time::{Instant, UNIX_EPOCH},
+    time::Instant,
 };
 
 use anyhow::{Context, bail};
+use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ingest::SyncPhase;
 use render::HtmlSafety;
-use rusqlite::{Connection, OptionalExtension, params};
 use store_sqlite::SqliteStore;
 use tracing::{debug, info, trace};
 
@@ -635,10 +635,9 @@ struct DocsIndexSummary {
 
 #[derive(Debug)]
 struct ScannedDoc {
-    document_id: String,
     relative_path: String,
     title: String,
-    modified_at: String,
+    modified_at: DateTime<Utc>,
     size: i64,
     content_hash: String,
     content: String,
@@ -660,136 +659,67 @@ fn index_docs_root_with_db(root: &Path, db_path: &Path) -> anyhow::Result<DocsIn
         fs::create_dir_all(parent)
             .with_context(|| format!("creating parent dir for {}", db_path.display()))?;
     }
-    let mut conn = Connection::open(db_path)
+    let mut store = SqliteStore::open(db_path)
         .with_context(|| format!("opening sqlite db {}", db_path.display()))?;
-    conn.execute_batch(
-        "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
-    )?;
-    ensure_docs_schema(&conn)?;
+    store.init_schema()?;
 
-    let now = chrono::Utc::now().to_rfc3339();
-    let root_key = canonical_root.to_string_lossy().to_string();
-    let root_id = stable_id("doc-root", &[&root_key]);
-    let generation = reserve_generation(&conn, &root_id, &root_key, &now)?;
-    let scan = scan_docs_tree(&canonical_root, &root_id)?;
+    let canonical_root_str = canonical_root.to_string_lossy().to_string();
+    let sync = store.begin_doc_sync(&canonical_root_str)?;
+    let scan = match scan_docs_tree(&canonical_root) {
+        Ok(scan) => scan,
+        Err(err) => {
+            let _ = store.fail_doc_sync(&sync.root_id, sync.generation);
+            return Err(err);
+        }
+    };
 
-    let tx = conn.transaction()?;
-    let mut indexed = 0usize;
-    let mut updated = 0usize;
-    let skipped = scan.skipped;
-    for doc in &scan.docs {
-        let existing: Option<(String, i64, String)> = tx
-            .query_row(
-                "SELECT modified_at, size_bytes, content_hash
-                 FROM documents
-                 WHERE root_id = ?1 AND relative_path = ?2",
-                params![root_id, doc.relative_path],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
+    let result = (|| -> anyhow::Result<DocsIndexSummary> {
+        let mut indexed = 0usize;
+        let mut updated = 0usize;
 
-        let unchanged = existing
-            .as_ref()
-            .is_some_and(|(modified_at, size, content_hash)| {
-                modified_at == &doc.modified_at
-                    && *size == doc.size
-                    && content_hash == &doc.content_hash
+        for doc in &scan.docs {
+            let existing = store.get_document_by_path(&sync.root_id, &doc.relative_path)?;
+            let unchanged = existing.as_ref().is_some_and(|existing| {
+                existing.modified_at == doc.modified_at
+                    && existing.size_bytes == doc.size
+                    && existing.content_hash == doc.content_hash
             });
-        if unchanged {
-            tx.execute(
-                "UPDATE documents
-                 SET last_seen_generation = ?3,
-                     indexed_generation = ?3,
-                     indexed_at = ?4
-                 WHERE root_id = ?1 AND relative_path = ?2",
-                params![root_id, doc.relative_path, generation, now],
-            )?;
-            continue;
-        }
 
-        if existing.is_some() {
-            updated += 1;
-        } else {
-            indexed += 1;
-        }
+            if !unchanged {
+                if existing.is_some() {
+                    updated += 1;
+                } else {
+                    indexed += 1;
+                }
+            }
 
-        tx.execute(
-            "INSERT INTO documents
-                (id, root_id, relative_path, title, modified_at, size_bytes, content_hash,
-                 last_seen_generation, indexed_generation, indexed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)
-             ON CONFLICT(root_id, relative_path) DO UPDATE SET
-                id = excluded.id,
-                title = excluded.title,
-                modified_at = excluded.modified_at,
-                size_bytes = excluded.size_bytes,
-                content_hash = excluded.content_hash,
-                last_seen_generation = excluded.last_seen_generation,
-                indexed_generation = excluded.indexed_generation,
-                indexed_at = excluded.indexed_at",
-            params![
-                doc.document_id,
-                root_id,
-                doc.relative_path,
-                doc.title,
+            store.upsert_document(
+                &sync.root_id,
+                &doc.relative_path,
+                &doc.title,
                 doc.modified_at,
                 doc.size,
-                doc.content_hash,
-                generation,
-                now,
-            ],
-        )?;
-        tx.execute(
-            "DELETE FROM fts_documents WHERE document_id = ?1",
-            params![doc.document_id],
-        )?;
-        tx.execute(
-            "INSERT INTO fts_documents (document_id, root_id, path, title, content)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                doc.document_id,
-                root_id,
-                doc.relative_path,
-                doc.title,
-                doc.content
-            ],
-        )?;
+                &doc.content_hash,
+                &doc.content,
+                sync.generation,
+            )?;
+        }
+
+        let finalize = store.finalize_doc_sync(&sync.root_id, sync.generation)?;
+        Ok(DocsIndexSummary {
+            indexed,
+            updated,
+            skipped: scan.skipped,
+            deleted: finalize.deleted_documents,
+            errors: scan.errors,
+        })
+    })();
+
+    if result.is_err() {
+        let _ = store.fail_doc_sync(&sync.root_id, sync.generation);
     }
 
-    let stale_ids: Vec<String> = {
-        let mut stmt = tx.prepare(
-            "SELECT id
-             FROM documents
-             WHERE root_id = ?1 AND last_seen_generation <> ?2",
-        )?;
-        let rows = stmt.query_map(params![root_id, generation], |row| row.get(0))?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()?
-    };
-    let deleted = stale_ids.len();
-    for stale_id in &stale_ids {
-        tx.execute(
-            "DELETE FROM fts_documents WHERE document_id = ?1",
-            params![stale_id],
-        )?;
-        tx.execute("DELETE FROM documents WHERE id = ?1", params![stale_id])?;
-    }
-    tx.execute(
-        "UPDATE doc_roots
-         SET last_completed_generation = ?2,
-             scan_completed_at = ?3,
-             scan_status = 'completed'
-         WHERE root_id = ?1 AND current_generation = ?2",
-        params![root_id, generation, now],
-    )?;
-    tx.commit()?;
-
-    Ok(DocsIndexSummary {
-        indexed,
-        updated,
-        skipped,
-        deleted,
-        errors: scan.errors,
-    })
+    result
 }
 
 struct DocsScan {
@@ -798,7 +728,7 @@ struct DocsScan {
     errors: usize,
 }
 
-fn scan_docs_tree(root: &Path, root_id: &str) -> anyhow::Result<DocsScan> {
+fn scan_docs_tree(root: &Path) -> anyhow::Result<DocsScan> {
     let mut docs = Vec::new();
     let mut skipped = 0usize;
     let mut errors = 0usize;
@@ -867,13 +797,10 @@ fn scan_docs_tree(root: &Path, root_id: &str) -> anyhow::Result<DocsScan> {
             let title = doc_title(&path, &content);
             let modified_at = metadata
                 .modified()
-                .ok()
-                .and_then(|ts| ts.duration_since(UNIX_EPOCH).ok())
-                .map(|ts| ts.as_secs().to_string())
-                .unwrap_or_else(|| "0".to_string());
+                .map(DateTime::<Utc>::from)
+                .unwrap_or_else(|_| Utc::now());
             let content_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
             docs.push(ScannedDoc {
-                document_id: stable_id("doc", &[root_id, &relative_path]),
                 relative_path,
                 title,
                 modified_at,
@@ -891,77 +818,6 @@ fn scan_docs_tree(root: &Path, root_id: &str) -> anyhow::Result<DocsScan> {
         skipped,
         errors,
     })
-}
-
-fn ensure_docs_schema(conn: &Connection) -> anyhow::Result<()> {
-    conn.execute_batch(
-        r#"
-        CREATE TABLE IF NOT EXISTS doc_roots (
-          root_id TEXT PRIMARY KEY,
-          canonical_path TEXT NOT NULL UNIQUE,
-          current_generation INTEGER NOT NULL DEFAULT 0,
-          last_completed_generation INTEGER NOT NULL DEFAULT 0,
-          scan_started_at TEXT,
-          scan_completed_at TEXT,
-          scan_status TEXT NOT NULL DEFAULT 'idle'
-        );
-        CREATE TABLE IF NOT EXISTS documents (
-          id TEXT PRIMARY KEY,
-          root_id TEXT NOT NULL,
-          relative_path TEXT NOT NULL,
-          title TEXT NOT NULL,
-          modified_at TEXT NOT NULL,
-          size_bytes INTEGER NOT NULL,
-          content_hash TEXT NOT NULL,
-          last_seen_generation INTEGER NOT NULL,
-          indexed_generation INTEGER NOT NULL,
-          indexed_at TEXT NOT NULL,
-          UNIQUE(root_id, relative_path),
-          FOREIGN KEY(root_id) REFERENCES doc_roots(root_id) ON DELETE CASCADE
-        );
-        CREATE VIRTUAL TABLE IF NOT EXISTS fts_documents USING fts5(
-          document_id UNINDEXED,
-          root_id UNINDEXED,
-          path,
-          title,
-          content,
-          tokenize = 'unicode61 tokenchars ''_./:-'''
-        );
-        CREATE INDEX IF NOT EXISTS idx_documents_root_id ON documents(root_id);
-        CREATE INDEX IF NOT EXISTS idx_documents_root_generation ON documents(root_id, last_seen_generation);
-        "#,
-    )?;
-    Ok(())
-}
-
-fn reserve_generation(
-    conn: &Connection,
-    root_id: &str,
-    canonical_path: &str,
-    now: &str,
-) -> anyhow::Result<i64> {
-    let previous_generation: i64 = conn
-        .query_row(
-            "SELECT current_generation FROM doc_roots WHERE root_id = ?1",
-            params![root_id],
-            |row| row.get(0),
-        )
-        .optional()?
-        .unwrap_or(0);
-    let generation = previous_generation + 1;
-    conn.execute(
-        "INSERT INTO doc_roots
-            (root_id, canonical_path, current_generation, scan_started_at, scan_completed_at, scan_status)
-         VALUES (?1, ?2, ?3, ?4, NULL, 'running')
-         ON CONFLICT(root_id) DO UPDATE SET
-            canonical_path = excluded.canonical_path,
-            current_generation = excluded.current_generation,
-            scan_started_at = excluded.scan_started_at,
-            scan_completed_at = NULL,
-            scan_status = excluded.scan_status",
-        params![root_id, canonical_path, generation, now],
-    )?;
-    Ok(generation)
 }
 
 fn default_db_path() -> PathBuf {
@@ -1010,16 +866,6 @@ fn doc_title(path: &Path, content: &str) -> String {
         .filter(|stem| !stem.is_empty())
         .map(|stem| stem.to_string())
         .unwrap_or_else(|| path.display().to_string())
-}
-
-fn stable_id(prefix: &str, parts: &[&str]) -> String {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(prefix.as_bytes());
-    for part in parts {
-        hasher.update(&[0]);
-        hasher.update(part.as_bytes());
-    }
-    format!("{prefix}-{}", hasher.finalize().to_hex())
 }
 
 #[cfg(feature = "semantic")]
