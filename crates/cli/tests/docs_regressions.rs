@@ -23,27 +23,19 @@ fn fresh_data_home() -> PathBuf {
 }
 
 /// The directory `dirs::data_dir()` resolves to for the child process given the
-/// env vars `remi_cmd` sets. macOS and Windows ignore the XDG vars, so the
-/// tests must mirror each platform's convention or they seed a DB the app
-/// never opens (the cause of the pre-existing macOS-only failures).
+/// env vars `remi_cmd` sets. macOS ignores the XDG vars, so the tests must
+/// mirror its convention or they seed a DB the app never opens (the cause of
+/// the pre-existing macOS-only failures). On Linux and Windows `remi_cmd` pins
+/// XDG_DATA_HOME/APPDATA to `home`, which `dirs` honors, so the data dir is
+/// exactly `home` there.
 fn data_dir_for(home: &Path) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         home.join("Library").join("Application Support")
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(not(target_os = "macos"))]
     {
-        // `dirs::data_dir()` on Windows is %APPDATA% (Roaming).
-        std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.to_path_buf())
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        // `dirs::data_dir()` honors $XDG_DATA_HOME when set, else $HOME/.local/share.
-        std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local").join("share"))
+        home.to_path_buf()
     }
 }
 
