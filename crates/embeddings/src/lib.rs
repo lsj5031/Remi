@@ -73,13 +73,35 @@ impl Embedder {
             .encode(text_cow.as_ref(), true)
             .map_err(|e| anyhow::anyhow!("encoding error: {}", e))?;
 
-        let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
-        let attention_mask: Vec<i64> = encoding
+        // ONNX graphs for BGE-style models are statically shaped at the model's
+        // max sequence length (512 for bge-small); over-long messages must be
+        // truncated to the declared input dimension or the session run fails
+        // with a broadcast error inside the pooling layer.
+        let max_seq_len = self
+            .session
+            .inputs()
+            .iter()
+            .find(|i| i.name() == "input_ids")
+            .and_then(|i| match i.dtype() {
+                ort::value::ValueType::Tensor { shape, .. } => shape.get(1).copied(),
+                _ => None,
+            })
+            .and_then(|dim| usize::try_from(dim).ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(512);
+
+        let mut input_ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
+        let mut attention_mask: Vec<i64> = encoding
             .get_attention_mask()
             .iter()
             .map(|&x| x as i64)
             .collect();
-        let token_type_ids: Vec<i64> = encoding.get_type_ids().iter().map(|&x| x as i64).collect();
+        let mut token_type_ids: Vec<i64> =
+            encoding.get_type_ids().iter().map(|&x| x as i64).collect();
+
+        input_ids.truncate(max_seq_len);
+        attention_mask.truncate(max_seq_len);
+        token_type_ids.truncate(max_seq_len);
 
         let batch_size = 1;
         let seq_len = input_ids.len();

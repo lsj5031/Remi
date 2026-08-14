@@ -644,7 +644,7 @@ GitHub release workflow publishes:
 - `remi-macos-arm64-simple.tar.gz` (binary only)
 - `remi-windows-x64-simple.zip` (binary only)
 
-As of `v0.2.2` (August 14, 2026), published assets are Linux x64 (simple + bundled), macOS arm64 (simple), and Windows x64 (simple).
+As of `v0.2.3` (August 14, 2026), published assets are Linux x64 (simple + bundled), macOS arm64 (simple + bundled), and Windows x64 (simple + bundled).
 
 ---
 

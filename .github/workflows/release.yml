@@ -9,6 +9,13 @@ on:
 permissions:
   contents: write
 
+env:
+  ORT_VERSION: "1.23.0"
+  # Files the embedder actually loads (model.onnx, tokenizer.json) plus the
+  # small config/tokenizer files; the HF repo's other weight formats
+  # (safetensors, pytorch bin, onnx/ mirror) are dead weight in the bundle.
+  MODEL_FILES: "tokenizer.json config.json special_tokens_map.json tokenizer_config.json vocab.txt modules.json sentence_bert_config.json config_sentence_transformers.json"
+
 jobs:
   build-linux:
     runs-on: ubuntu-latest
@@ -38,48 +45,24 @@ jobs:
       - name: Prepare bundled artifact
         run: |
           set -euo pipefail
-          mkdir -p dist/bundled/bin dist/bundled/models dist/bundled/runtime
+          mkdir -p dist/bundled/bin dist/bundled/models/bge-small-en-v1.5 dist/bundled/runtime/onnxruntime
           # The bundled asset ships the ONNX runtime + model, so the binary
           # must be built with the semantic feature or `remi embed` would be
           # absent from the one artifact that can run it offline.
           cargo build -p cli --release --features semantic
           cp target/release/remi dist/bundled/bin/
 
-          ORT_VERSION=1.23.0
           ORT_TGZ=onnxruntime-linux-x64-${ORT_VERSION}.tgz
-          curl -L -o /tmp/${ORT_TGZ} https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ORT_TGZ}
+          curl -sL -o /tmp/${ORT_TGZ} https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ORT_TGZ}
           tar -xzf /tmp/${ORT_TGZ} -C /tmp
-          mkdir -p dist/bundled/runtime/onnxruntime
           cp -R /tmp/onnxruntime-linux-x64-${ORT_VERSION} dist/bundled/runtime/onnxruntime/
 
-          python3 -m venv .venv
-          .venv/bin/python -m pip install --upgrade pip huggingface_hub
-          .venv/bin/python - <<'PY'
-          from huggingface_hub import snapshot_download
-          snapshot_download(
-              repo_id="BAAI/bge-small-en-v1.5",
-              local_dir="dist/bundled/models/bge-small-en-v1.5",
-              local_dir_use_symlinks=False,
-          )
-          PY
-
-          if [ -f dist/bundled/models/bge-small-en-v1.5/onnx/model.onnx ] && [ ! -f dist/bundled/models/bge-small-en-v1.5/model.onnx ]; then
-            cp dist/bundled/models/bge-small-en-v1.5/onnx/model.onnx dist/bundled/models/bge-small-en-v1.5/model.onnx
-          fi
-
-          # snapshot_download pulls every weight format from the HF repo; the
-          # embedder only loads model.onnx + tokenizer.json. Drop the duplicate
-          # weight copies (safetensors, pytorch bin, onnx/ mirror) and keep the
-          # single ONNX model plus the small config/tokenizer files, so the
-          # bundled asset stays ~100 MB instead of ~320 MB.
-          rm -rf dist/bundled/models/bge-small-en-v1.5/onnx
-          find dist/bundled/models/bge-small-en-v1.5 -type f \
-            ! -name 'model.onnx' ! -name 'tokenizer.json' ! -name 'config.json' \
-            ! -name 'special_tokens_map.json' ! -name 'tokenizer_config.json' \
-            ! -name 'vocab.txt' ! -name 'modules.json' \
-            ! -name 'sentence_bert_config.json' ! -name 'config_sentence_transformers.json' \
-            -delete
-          rm -rf dist/bundled/models/bge-small-en-v1.5/.cache
+          MODEL_DIR=dist/bundled/models/bge-small-en-v1.5
+          BASE=https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main
+          curl -sL -o "$MODEL_DIR/model.onnx" "$BASE/onnx/model.onnx"
+          for f in $MODEL_FILES; do
+            curl -sL -o "$MODEL_DIR/$f" "$BASE/$f"
+          done
           tar -czf remi-linux-x64-bundled.tar.gz -C dist/bundled .
 
       - name: Upload release assets
@@ -107,7 +90,7 @@ jobs:
       - name: Build release binary
         run: cargo build -p cli --release
 
-      - name: Package macOS artifact
+      - name: Package macOS artifacts (simple + bundled)
         if: matrix.platform == 'macos'
         id: package-macos
         shell: bash
@@ -119,28 +102,75 @@ jobs:
             arm64|aarch64) arch_label="arm64" ;;
             *) arch_label="$arch" ;;
           esac
-          asset="remi-macos-${arch_label}-simple.tar.gz"
-          tar -czf "${asset}" -C target/release remi
-          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+          simple="remi-macos-${arch_label}-simple.tar.gz"
+          tar -czf "${simple}" -C target/release remi
 
-      - name: Package Windows artifact
+          # Bundled: rebuild with the semantic feature so `remi embed` runs
+          # offline, then ship the ORT runtime + model alongside the binary.
+          cargo build -p cli --release --features semantic
+          mkdir -p dist/bundled/bin dist/bundled/models/bge-small-en-v1.5 dist/bundled/runtime/onnxruntime
+          cp target/release/remi dist/bundled/bin/
+
+          ORT_TGZ=onnxruntime-osx-${arch_label}-${ORT_VERSION}.tgz
+          curl -sL -o /tmp/${ORT_TGZ} https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${ORT_TGZ}
+          tar -xzf /tmp/${ORT_TGZ} -C /tmp
+          cp -R /tmp/onnxruntime-osx-${arch_label}-${ORT_VERSION} dist/bundled/runtime/onnxruntime/
+
+          MODEL_DIR=dist/bundled/models/bge-small-en-v1.5
+          BASE=https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main
+          curl -sL -o "$MODEL_DIR/model.onnx" "$BASE/onnx/model.onnx"
+          for f in $MODEL_FILES; do
+            curl -sL -o "$MODEL_DIR/$f" "$BASE/$f"
+          done
+          bundled="remi-macos-${arch_label}-bundled.tar.gz"
+          tar -czf "${bundled}" -C dist/bundled .
+          echo "asset_simple=${simple}" >> "$GITHUB_OUTPUT"
+          echo "asset_bundled=${bundled}" >> "$GITHUB_OUTPUT"
+
+      - name: Package Windows artifacts (simple + bundled)
         if: matrix.platform == 'windows'
         id: package-windows
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $archLabel = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
-          $asset = "remi-windows-$archLabel-simple.zip"
-          Compress-Archive -Path target/release/remi.exe -DestinationPath $asset -Force
-          "asset=$asset" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          $simple = "remi-windows-$archLabel-simple.zip"
+          Compress-Archive -Path target/release/remi.exe -DestinationPath $simple -Force
 
-      - name: Upload macOS release asset
+          # Bundled: rebuild with the semantic feature so `remi embed` runs
+          # offline, then ship the ORT runtime + model alongside the binary.
+          cargo build -p cli --release --features semantic
+          New-Item -ItemType Directory -Force -Path dist/bundled/bin, dist/bundled/models/bge-small-en-v1.5, dist/bundled/runtime/onnxruntime | Out-Null
+          Copy-Item target/release/remi.exe dist/bundled/bin/
+
+          $ortZip = "onnxruntime-win-$archLabel-$env:ORT_VERSION.zip"
+          curl.exe -sL -o $ortZip "https://github.com/microsoft/onnxruntime/releases/download/v$env:ORT_VERSION/$ortZip"
+          Expand-Archive -Path $ortZip -DestinationPath /tmp/ort -Force
+          Copy-Item -Recurse "/tmp/ort/onnxruntime-win-$archLabel-$env:ORT_VERSION" dist/bundled/runtime/onnxruntime/
+
+          $modelDir = "dist/bundled/models/bge-small-en-v1.5"
+          $base = "https://huggingface.co/BAAI/bge-small-en-v1.5/resolve/main"
+          curl.exe -sL -o "$modelDir/model.onnx" "$base/onnx/model.onnx"
+          foreach ($f in $env:MODEL_FILES.Split(" ")) {
+            curl.exe -sL -o "$modelDir/$f" "$base/$f"
+          }
+          $bundled = "remi-windows-$archLabel-bundled.zip"
+          Compress-Archive -Path dist/bundled/* -DestinationPath $bundled -Force
+          "asset_simple=$simple" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "asset_bundled=$bundled" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload macOS release assets
         if: matrix.platform == 'macos'
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.package-macos.outputs.asset }}
+          files: |
+            ${{ steps.package-macos.outputs.asset_simple }}
+            ${{ steps.package-macos.outputs.asset_bundled }}
 
-      - name: Upload Windows release asset
+      - name: Upload Windows release assets
         if: matrix.platform == 'windows'
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.package-windows.outputs.asset }}
+          files: |
+            ${{ steps.package-windows.outputs.asset_simple }}
+            ${{ steps.package-windows.outputs.asset_bundled }}

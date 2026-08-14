@@ -594,9 +594,14 @@ fn main() -> anyhow::Result<()> {
                             if m.content.trim().is_empty() {
                                 continue;
                             }
-                            if let Ok(vec) = embedder.embed(&m.content, false) {
-                                store.save_embedding(&m.id, &vec)?;
-                                count += 1;
+                            match embedder.embed(&m.content, false) {
+                                Ok(vec) => {
+                                    store.save_embedding(&m.id, &vec)?;
+                                    count += 1;
+                                }
+                                Err(err) => {
+                                    tracing::warn!(message_id = %m.id, error = %err, "failed to embed message");
+                                }
                             }
                         }
                         if count > 0 && count % 100 == 0 {

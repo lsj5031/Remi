@@ -115,9 +115,14 @@ fn save_chunk(
     if let Some(embedder) = embedder {
         let mut embedded = 0usize;
         for msg in &batch.messages {
-            if let Ok(vec) = embedder.embed(&msg.content, false) {
-                let _ = store.save_embedding(&msg.id, &vec);
-                embedded += 1;
+            match embedder.embed(&msg.content, false) {
+                Ok(vec) => {
+                    let _ = store.save_embedding(&msg.id, &vec);
+                    embedded += 1;
+                }
+                Err(err) => {
+                    tracing::warn!(message_id = %msg.id, error = %err, "failed to embed message");
+                }
             }
         }
         debug!(

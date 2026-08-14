@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2026-08-14
+
+### Added
+
+- Bundled release assets for macOS arm64 and Windows x64 (`remi-macos-arm64-bundled.tar.gz`, `remi-windows-x64-bundled.zip`), each shipping the binary built with the `semantic` feature plus the ONNX Runtime and BGE model so `remi embed` runs offline on those platforms too. The release workflow's model fetch now uses a direct keep-list download on all three platforms instead of the full HF snapshot + prune.
+
+### Fixed
+
+- The embedder fed over-long messages (beyond the model's static 512-token sequence length) to the ONNX graph, which failed inside the pooling layer and silently skipped those messages (`remi embed --rebuild` embedded only 490 of 630 real messages). Inputs are now truncated to the model's declared sequence dimension, and embedding failures log a warning instead of failing silently.
+
 ## [0.2.2] - 2026-08-14
 
 ### Fixed
