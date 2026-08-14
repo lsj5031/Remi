@@ -6,7 +6,7 @@ use core_model::{
     ArchiveItem, ArchiveRun, Checkpoint, Message, NormalizedBatch, Provenance, Session,
     deterministic_id,
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use std::time::Instant;
 use tracing::{debug, info, trace};
 
@@ -39,6 +39,23 @@ pub struct DocRootRecord {
     pub scan_started_at: Option<DateTime<Utc>>,
     pub scan_completed_at: Option<DateTime<Utc>>,
     pub scan_status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocUpsert {
+    pub relative_path: String,
+    pub title: String,
+    pub modified_at: DateTime<Utc>,
+    pub size_bytes: i64,
+    pub content_hash: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionSummary {
+    pub session: Session,
+    pub message_count: usize,
+    pub first_user_message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,12 +196,19 @@ impl SqliteStore {
                   vec BLOB NOT NULL,
                   FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE CASCADE
                 );
+                -- External-content FTS: the message text lives only in `messages`;
+                -- the FTS table stores just the inverted index. `save_batch` and
+                -- `delete_session_cascade` keep the index in sync explicitly
+                -- (prepared statements, not per-row triggers — triggers measured
+                -- ~3x slower on the ingest hot path).
                 CREATE VIRTUAL TABLE IF NOT EXISTS fts_messages USING fts5(
-                  message_id UNINDEXED,
+                  id UNINDEXED,
                   session_id UNINDEXED,
                   content,
                   ts UNINDEXED,
-                  tokenize = 'unicode61 tokenchars ''_./:-'''
+                  tokenize = 'unicode61 tokenchars ''_./:-''',
+                  content = 'messages',
+                  content_rowid = 'rowid'
                 );
                 CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
                 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
@@ -253,6 +277,29 @@ impl SqliteStore {
                 "#,
             )?;
         }
+        if version < 4 {
+            // Migrate fts_messages to external content (content = 'messages'):
+            // drop the stored-content FTS table, rebuild it in external-content
+            // mode, and reindex from the canonical `messages` table.
+            self.conn.execute_batch(
+                r#"
+                DROP TABLE IF EXISTS fts_messages;
+                CREATE VIRTUAL TABLE fts_messages USING fts5(
+                  id UNINDEXED,
+                  session_id UNINDEXED,
+                  content,
+                  ts UNINDEXED,
+                  tokenize = 'unicode61 tokenchars ''_./:-''',
+                  content = 'messages',
+                  content_rowid = 'rowid'
+                );
+                INSERT INTO fts_messages(rowid, id, session_id, content, ts)
+                SELECT rowid, id, session_id, content, ts FROM messages;
+                PRAGMA user_version = 4;
+                "#,
+            )?;
+            debug!("migrated fts_messages to external content");
+        }
         for (id, name) in [
             ("pi", "pi"),
             ("droid", "droid"),
@@ -308,6 +355,27 @@ impl SqliteStore {
             "sessions upserted"
         );
         last = now;
+        // Pre-read the rows this batch touches so the FTS sync can supply the
+        // *previous* content/ts when a message's content changed (external-content
+        // FTS must delete stale postings with the old values, read before the
+        // upsert overwrites them). Unchanged rows need no FTS write at all.
+        let mut old_state: std::collections::HashMap<String, (i64, String, String)> =
+            std::collections::HashMap::new();
+        {
+            let mut stmt_old =
+                tx.prepare_cached("SELECT rowid, content, ts FROM messages WHERE id = ?1")?;
+            for m in &batch.messages {
+                if let Ok((rowid, content, ts)) = stmt_old.query_row(params![m.id], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                }) {
+                    old_state.insert(m.id.clone(), (rowid, content, ts));
+                }
+            }
+        }
         {
             let mut stmt_msg = tx.prepare_cached(
                 r#"INSERT INTO messages (id, session_id, role, content, ts)
@@ -335,26 +403,41 @@ impl SqliteStore {
         );
         last = now;
         {
-            let mut seen_message_ids = std::collections::HashSet::new();
             let mut stmt_lookup_rowid =
                 tx.prepare_cached("SELECT rowid FROM messages WHERE id = ?1")?;
-            let mut stmt_delete_message =
-                tx.prepare_cached("DELETE FROM fts_messages WHERE rowid = ?1")?;
+            let mut stmt_delete = tx.prepare_cached(
+                "INSERT INTO fts_messages(fts_messages, rowid, id, session_id, content, ts)
+                VALUES ('delete', ?1, ?2, ?3, ?4, ?5)",
+            )?;
             let mut stmt_insert = tx.prepare_cached(
-                "INSERT INTO fts_messages (rowid, message_id, session_id, content, ts)
+                "INSERT INTO fts_messages (rowid, id, session_id, content, ts)
                 VALUES (?1, ?2, ?3, ?4, ?5)",
             )?;
             for m in &batch.messages {
-                if seen_message_ids.insert(&m.id) {
-                    let rowid: i64 = stmt_lookup_rowid.query_row(params![m.id], |r| r.get(0))?;
-                    stmt_delete_message.execute(params![rowid])?;
-                    stmt_insert.execute(params![
-                        rowid,
-                        m.id,
-                        m.session_id,
-                        m.content,
-                        m.ts.to_rfc3339()
-                    ])?;
+                let ts = m.ts.to_rfc3339();
+                match old_state.get(&m.id) {
+                    // Content unchanged: the external table already reflects the
+                    // row, so there is nothing to index (idempotent re-syncs
+                    // cost no FTS writes at all).
+                    Some((_, old_content, _)) if *old_content == m.content => {}
+                    // Content changed: remove the stale postings (old values)
+                    // before indexing the new text.
+                    Some((rowid, old_content, old_ts)) => {
+                        stmt_delete.execute(params![
+                            rowid,
+                            m.id,
+                            m.session_id,
+                            old_content,
+                            old_ts
+                        ])?;
+                        stmt_insert.execute(params![rowid, m.id, m.session_id, m.content, &ts])?;
+                    }
+                    // New row: resolve the freshly assigned rowid and index it.
+                    None => {
+                        let rowid: i64 =
+                            stmt_lookup_rowid.query_row(params![m.id], |r| r.get(0))?;
+                        stmt_insert.execute(params![rowid, m.id, m.session_id, m.content, &ts])?;
+                    }
                 }
             }
         }
@@ -362,7 +445,7 @@ impl SqliteStore {
         info!(
             elapsed = ?now.duration_since(started),
             delta = ?now.duration_since(last),
-            "fts updated"
+            "fts synced"
         );
         last = now;
         {
@@ -650,13 +733,115 @@ impl SqliteStore {
             params![root_id, relative_path],
             |r| r.get(0),
         )?;
-        tx.execute("DELETE FROM fts_documents WHERE rowid = ?1", params![rowid])?;
         tx.execute(
-            "INSERT INTO fts_documents (rowid, document_id, root_id, path, title, content) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT OR REPLACE INTO fts_documents (rowid, document_id, root_id, path, title, content) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![rowid, document_id.as_str(), root_id, relative_path, title, content],
         )?;
         tx.commit()?;
         Ok(document_id)
+    }
+
+    pub fn get_documents_for_root(&self, root_id: &str) -> anyhow::Result<Vec<DocumentRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, root_id, relative_path, title, modified_at, size_bytes, content_hash, last_seen_generation, indexed_generation, indexed_at FROM documents WHERE root_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![root_id], |r| {
+            Ok(DocumentRecord {
+                document_id: r.get(0)?,
+                root_id: r.get(1)?,
+                relative_path: r.get(2)?,
+                title: r.get(3)?,
+                modified_at: parse_ts(r.get(4)?),
+                size_bytes: r.get(5)?,
+                content_hash: r.get(6)?,
+                last_seen_generation: r.get(7)?,
+                indexed_generation: r.get(8)?,
+                indexed_at: parse_ts(r.get(9)?),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Upsert many documents (and their FTS rows) inside a single transaction.
+    pub fn upsert_documents_batch(
+        &mut self,
+        root_id: &str,
+        generation: i64,
+        docs: &[DocUpsert],
+    ) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt_doc = tx.prepare_cached(
+                r#"INSERT INTO documents (id, root_id, relative_path, title, modified_at, size_bytes, content_hash, last_seen_generation, indexed_generation, indexed_at)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9)
+                ON CONFLICT(root_id, relative_path) DO UPDATE SET
+                  id=excluded.id,
+                  title=excluded.title,
+                  modified_at=excluded.modified_at,
+                  size_bytes=excluded.size_bytes,
+                  content_hash=excluded.content_hash,
+                  last_seen_generation=excluded.last_seen_generation,
+                  indexed_generation=excluded.indexed_generation,
+                  indexed_at=excluded.indexed_at"#,
+            )?;
+            let mut stmt_fts_rowid = tx.prepare_cached(
+                "SELECT rowid FROM documents WHERE root_id = ?1 AND relative_path = ?2",
+            )?;
+            let mut stmt_fts = tx.prepare_cached(
+                "INSERT OR REPLACE INTO fts_documents (rowid, document_id, root_id, path, title, content) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for d in docs {
+                let document_id = document_id(root_id, &d.relative_path);
+                let indexed_at = Utc::now().to_rfc3339();
+                stmt_doc.execute(params![
+                    document_id.as_str(),
+                    root_id,
+                    d.relative_path,
+                    d.title,
+                    d.modified_at.to_rfc3339(),
+                    d.size_bytes,
+                    d.content_hash,
+                    generation,
+                    indexed_at,
+                ])?;
+                let rowid: i64 =
+                    stmt_fts_rowid.query_row(params![root_id, d.relative_path], |r| r.get(0))?;
+                stmt_fts.execute(params![
+                    rowid,
+                    document_id.as_str(),
+                    root_id,
+                    d.relative_path,
+                    d.title,
+                    d.content,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Mark a set of documents as seen in the current generation without rewriting them.
+    pub fn mark_documents_seen(
+        &self,
+        root_id: &str,
+        generation: i64,
+        relative_paths: &[String],
+    ) -> anyhow::Result<()> {
+        for chunk in relative_paths.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "UPDATE documents SET last_seen_generation = ?2 WHERE root_id = ?1 AND relative_path IN ({placeholders})"
+            );
+            let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk.len() + 2);
+            params.push(&root_id);
+            params.push(&generation);
+            params.extend(chunk.iter().map(|p| p as &dyn rusqlite::ToSql));
+            self.conn.execute(&sql, params_from_iter(params))?;
+        }
+        Ok(())
     }
 
     pub fn finalize_doc_sync(
@@ -882,6 +1067,77 @@ impl SqliteStore {
             .map_err(Into::into)
     }
 
+    /// Load summary data for many sessions in a constant number of queries
+    /// instead of two queries per session.
+    pub fn get_session_summaries(
+        &self,
+        session_ids: &[String],
+    ) -> anyhow::Result<std::collections::HashMap<String, SessionSummary>> {
+        let mut out = std::collections::HashMap::with_capacity(session_ids.len());
+        if session_ids.is_empty() {
+            return Ok(out);
+        }
+        let placeholders = std::iter::repeat_n("?", session_ids.len())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT id, agent, source_ref, title, created_at, updated_at FROM sessions WHERE id IN ({placeholders})"
+        ))?;
+        let rows = stmt.query_map(params_from_iter(session_ids), |r| {
+            let agent_str: String = r.get(1)?;
+            Ok((
+                r.get::<_, String>(0)?,
+                Session {
+                    id: r.get(0)?,
+                    agent: parse_agent(&agent_str)?,
+                    source_ref: r.get(2)?,
+                    title: r.get(3)?,
+                    created_at: parse_ts(r.get(4)?),
+                    updated_at: parse_ts(r.get(5)?),
+                },
+            ))
+        })?;
+        let sessions = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        for (id, session) in sessions {
+            out.insert(
+                id,
+                SessionSummary {
+                    session,
+                    message_count: 0,
+                    first_user_message: None,
+                },
+            );
+        }
+
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT session_id, COUNT(*) FROM messages WHERE session_id IN ({placeholders}) GROUP BY session_id"
+        ))?;
+        let rows = stmt.query_map(params_from_iter(session_ids), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+        })?;
+        for (id, count) in rows.collect::<rusqlite::Result<Vec<_>>>()? {
+            if let Some(entry) = out.get_mut(&id) {
+                entry.message_count = count;
+            }
+        }
+
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT session_id, content FROM messages WHERE session_id IN ({placeholders}) AND lower(role) = 'user' ORDER BY ts ASC, rowid ASC"
+        ))?;
+        let rows = stmt.query_map(params_from_iter(session_ids), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for (id, content) in rows.collect::<rusqlite::Result<Vec<_>>>()? {
+            if let Some(entry) = out.get_mut(&id)
+                && entry.first_user_message.is_none()
+            {
+                entry.first_user_message = Some(content);
+            }
+        }
+        Ok(out)
+    }
+
     pub fn get_provenance_for_session(&self, session_id: &str) -> anyhow::Result<Vec<Provenance>> {
         let mut stmt = self.conn.prepare(
             "SELECT p.id, p.entity_type, p.entity_id, p.agent, p.source_path, p.source_id FROM provenance p INNER JOIN messages m ON p.entity_id = m.id WHERE m.session_id = ?1",
@@ -904,7 +1160,7 @@ impl SqliteStore {
     pub fn search_lexical(&self, query: &str, limit: i64) -> anyhow::Result<Vec<SearchRow>> {
         debug!(query, limit, "lexical search");
         let mut stmt = self.conn.prepare(
-            "SELECT message_id, session_id, content, ts, bm25(fts_messages) AS rank FROM fts_messages WHERE fts_messages MATCH ?1 ORDER BY rank LIMIT ?2",
+            "SELECT id, session_id, content, ts, bm25(fts_messages) AS rank FROM fts_messages WHERE fts_messages MATCH ?1 ORDER BY rank LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![query, limit], |r| {
             let rank: f64 = r.get(4)?;
@@ -957,7 +1213,7 @@ impl SqliteStore {
     }
 
     pub fn plan_archive(
-        &self,
+        &mut self,
         older_than: Duration,
         keep_latest: usize,
     ) -> anyhow::Result<ArchiveRun> {
@@ -974,32 +1230,37 @@ impl SqliteStore {
             params![run_id, now.to_rfc3339(), older_than.num_seconds(), keep_latest as i64],
         )?;
 
+        let already_planned: std::collections::HashSet<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT ai.session_id FROM archive_items ai JOIN archive_runs ar ON ai.run_id = ar.id WHERE ar.executed = 0",
+            )?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+
         let sessions = self.list_sessions()?;
         let mut by_agent: std::collections::HashMap<&str, Vec<Session>> =
             std::collections::HashMap::new();
         for s in sessions {
             by_agent.entry(s.agent.as_str()).or_default().push(s);
         }
-        for grouped in by_agent.values_mut() {
-            grouped.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
-            for s in grouped.iter().skip(keep_latest) {
-                if s.updated_at < cutoff {
-                    let already_planned: bool = self.conn.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM archive_items ai JOIN archive_runs ar ON ai.run_id = ar.id WHERE ai.session_id = ?1 AND ar.executed = 0)",
-                        params![s.id],
-                        |r| r.get(0),
-                    )?;
-                    if already_planned {
-                        continue;
+
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt_insert = tx.prepare_cached(
+                "INSERT INTO archive_items (id, run_id, session_id, planned_delete) VALUES (?1, ?2, ?3, 1)",
+            )?;
+            for grouped in by_agent.values_mut() {
+                grouped.sort_by_key(|session| std::cmp::Reverse(session.updated_at));
+                for s in grouped.iter().skip(keep_latest) {
+                    if s.updated_at < cutoff && !already_planned.contains(&s.id) {
+                        let item_id = deterministic_id(&[&run_id, &s.id]);
+                        stmt_insert.execute(params![item_id, run_id, s.id])?;
                     }
-                    let item_id = deterministic_id(&[&run_id, &s.id]);
-                    self.conn.execute(
-                        "INSERT INTO archive_items (id, run_id, session_id, planned_delete) VALUES (?1, ?2, ?3, 1)",
-                        params![item_id, run_id, s.id],
-                    )?;
                 }
             }
         }
+        tx.commit()?;
 
         Ok(ArchiveRun {
             id: run_id,
@@ -1037,12 +1298,16 @@ impl SqliteStore {
 
     pub fn delete_session_cascade(&self, session_id: &str) -> anyhow::Result<()> {
         debug!(session_id, "cascading delete session");
-        self.conn
-            .execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
+        // Resolve rowids through the messages index first, while the rows
+        // still exist, then let the FK cascade remove the messages (and the
+        // embedding rows). External-content FTS has no stored content, so a
+        // plain DELETE by rowid suffices to drop the index entries.
         self.conn.execute(
-            "DELETE FROM fts_messages WHERE session_id = ?1",
+            "DELETE FROM fts_messages WHERE rowid IN (SELECT rowid FROM messages WHERE session_id = ?1)",
             params![session_id],
         )?;
+        self.conn
+            .execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
         Ok(())
     }
 
@@ -1739,5 +2004,87 @@ mod tests {
         assert_eq!(substring.len(), 1);
         assert_eq!(substring[0].relative_path, "guides/rust.md");
         assert!(substring[0].snippet.to_lowercase().contains("c++"));
+    }
+
+    #[test]
+    #[ignore = "benchmark: run with -- --ignored --nocapture"]
+    fn bench_save_batch() {
+        fn words(i: usize) -> String {
+            let pool = [
+                "refactor",
+                "session",
+                "memory",
+                "index",
+                "query",
+                "adapter",
+                "record",
+                "payload",
+                "checkpoint",
+                "cursor",
+                "token",
+                "lexical",
+                "normalize",
+                "batch",
+                "search",
+                "sqlite",
+                "fts",
+                "blake",
+                "thread",
+                "artifact",
+            ];
+            let mut content = String::with_capacity(220);
+            for w in 0..14 {
+                content.push_str(pool[(i + w) % pool.len()]);
+                content.push(' ');
+            }
+            content.push_str(&format!("unique_token_{i}"));
+            content
+        }
+
+        let now = Utc::now();
+        let mut batch = NormalizedBatch::default();
+        for i in 0..300 {
+            batch.sessions.push(Session {
+                id: format!("s{i}"),
+                agent: core_model::AgentKind::Pi,
+                source_ref: format!("ref{i}"),
+                title: format!("session {i}"),
+                created_at: now,
+                updated_at: now,
+            });
+        }
+        for i in 0..30_000usize {
+            batch.messages.push(Message {
+                id: format!("m{i}"),
+                session_id: format!("s{}", i % 300),
+                role: if i % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                content: words(i),
+                ts: now,
+            });
+            batch.provenance.push(Provenance {
+                id: format!("prov{i}"),
+                entity_type: "message".to_string(),
+                entity_id: format!("m{i}"),
+                agent: core_model::AgentKind::Pi,
+                source_path: "/tmp/bench".to_string(),
+                source_id: format!("src{i}"),
+            });
+        }
+
+        let mut cold = SqliteStore::open(":memory:").unwrap();
+        cold.init_schema().unwrap();
+        let t = Instant::now();
+        cold.save_batch(&batch).unwrap();
+        println!("save_batch cold insert 30k msgs: {:?}", t.elapsed());
+
+        let mut warm = SqliteStore::open(":memory:").unwrap();
+        warm.init_schema().unwrap();
+        warm.save_batch(&batch).unwrap();
+        let t = Instant::now();
+        warm.save_batch(&batch).unwrap();
+        println!(
+            "save_batch re-upsert 30k msgs (idempotent re-sync): {:?}",
+            t.elapsed()
+        );
     }
 }

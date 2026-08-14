@@ -1,9 +1,16 @@
-use std::{fs, io::BufRead, path::PathBuf};
+use std::{
+    io::{BufRead, Seek},
+    path::PathBuf,
+};
 
+use adapter_common::{
+    FileParseResult, FileTail, JsonlResume, ParsedCursor, ResumeKind, TailContext,
+};
 use chrono::{DateTime, Utc};
 use core_model::{
     AgentAdapter, AgentKind, ArchiveCapability, NativeRecord, NormalizedBatch, deterministic_id,
 };
+#[cfg(test)]
 use rayon::prelude::*;
 use serde_json::Value;
 use tracing::debug;
@@ -30,20 +37,17 @@ impl AgentAdapter for PiAdapter {
         Ok(out)
     }
 
-    fn scan_changes_since(
+    fn stream_changes_since(
         &self,
         source_paths: &[String],
         cursor: Option<&str>,
-    ) -> anyhow::Result<Vec<NativeRecord>> {
-        load_pi_jsonl(source_paths, cursor)
+        tx: std::sync::mpsc::SyncSender<NativeRecord>,
+    ) -> anyhow::Result<Option<String>> {
+        adapter_common::stream_jsonl_sources(source_paths, cursor, &tx, parse_pi_file)
     }
 
     fn normalize(&self, records: &[NativeRecord]) -> anyhow::Result<NormalizedBatch> {
         Ok(normalize_records(records))
-    }
-
-    fn checkpoint_cursor(&self, records: &[NativeRecord]) -> Option<String> {
-        adapter_common::checkpoint_cursor_from_records(records)
     }
 
     fn archive_capability(&self) -> ArchiveCapability {
@@ -156,6 +160,7 @@ fn format_tool_call(obj: &serde_json::Map<String, Value>) -> Option<String> {
     Some(out)
 }
 
+#[cfg(test)]
 fn load_pi_jsonl(
     source_paths: &[String],
     cursor: Option<&str>,
@@ -163,149 +168,8 @@ fn load_pi_jsonl(
     let parsed_cursor = cursor.and_then(adapter_common::parse_cursor);
     let mut out: Vec<NativeRecord> = source_paths
         .par_iter()
-        .flat_map(|path| {
-            let file_mtime = adapter_common::file_mtime(path);
-            if let Some(ref cur) = parsed_cursor
-                && let Some(mtime) = file_mtime
-                && mtime <= cur.ts
-            {
-                return Vec::new();
-            }
-
-            let file = match fs::File::open(path) {
-                Ok(f) => f,
-                Err(_) => return Vec::new(),
-            };
-            let reader = std::io::BufReader::new(file);
-            let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
-            if lines.is_empty() {
-                return Vec::new();
-            }
-
-            let mut session_id = String::new();
-            let mut session_ts: Option<DateTime<Utc>> = None;
-            let mut cwd: Option<String> = None;
-            let mut first_user_text: Option<String> = None;
-            let mut records = Vec::new();
-            let mut msg_index = 0usize;
-
-            for line in &lines {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let Ok(val): Result<Value, _> = serde_json::from_str(trimmed) else {
-                    continue;
-                };
-
-                let line_type = val.get("type").and_then(Value::as_str).unwrap_or("");
-                let line_ts = val
-                    .get("timestamp")
-                    .and_then(Value::as_str)
-                    .and_then(parse_rfc3339)
-                    .or(file_mtime)
-                    .unwrap_or_else(Utc::now);
-
-                match line_type {
-                    "session" => {
-                        if let Some(id) = val.get("id").and_then(Value::as_str) {
-                            session_id = id.to_string();
-                        }
-                        if let Some(dir) = val.get("cwd").and_then(Value::as_str) {
-                            cwd = Some(dir.to_string());
-                        }
-                        if session_ts.is_none() {
-                            session_ts = Some(line_ts);
-                        }
-                    }
-                    "message" => {
-                        let Some(msg) = val.get("message") else {
-                            continue;
-                        };
-                        let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
-
-                        let content_text = extract_message_content(role, msg.get("content"));
-                        if content_text.is_empty() {
-                            continue;
-                        }
-
-                        let mapped_role = match role {
-                            "user" => "user",
-                            _ => "assistant",
-                        };
-
-                        if mapped_role == "user" && first_user_text.is_none() {
-                            first_user_text = Some(content_text.clone());
-                        }
-
-                        let sid = if session_id.is_empty() {
-                            std::path::Path::new(path)
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or(path)
-                                .to_string()
-                        } else {
-                            session_id.clone()
-                        };
-                        let tool_result_id = (role == "toolResult").then(|| {
-                            val.get("id")
-                                .and_then(Value::as_str)
-                                .filter(|id| !id.is_empty())
-                                .map(ToOwned::to_owned)
-                                .unwrap_or_else(|| deterministic_id(&[path, trimmed]))
-                        });
-                        let source_id =
-                            format_pi_source_id(&sid, msg_index, tool_result_id.as_deref());
-                        msg_index += 1;
-
-                        if let Some(ref cur) = parsed_cursor
-                            && adapter_common::should_skip(line_ts, &source_id, cur)
-                        {
-                            continue;
-                        }
-
-                        let title = first_user_text
-                            .as_deref()
-                            .map(|t| {
-                                if t.chars().count() > 80 {
-                                    format!("{}…", t.chars().take(80).collect::<String>())
-                                } else {
-                                    t.to_string()
-                                }
-                            })
-                            .unwrap_or_else(|| sid.clone());
-
-                        let mut obj = serde_json::Map::new();
-                        obj.insert("role".to_string(), Value::String(role.to_string()));
-                        if let Some(content) = msg.get("content") {
-                            obj.insert("content".to_string(), content.clone());
-                        } else {
-                            obj.insert("content".to_string(), Value::Array(vec![]));
-                        }
-                        obj.insert("__thread_id".to_string(), Value::String(sid.clone()));
-                        obj.insert("__thread_title".to_string(), Value::String(title));
-                        if let Some(ts) = session_ts {
-                            obj.insert("__thread_ts".to_string(), Value::String(ts.to_rfc3339()));
-                        }
-                        obj.insert("__source_path".to_string(), Value::String(path.clone()));
-                        if let Some(ref dir) = cwd {
-                            obj.insert("__workspace_path".to_string(), Value::String(dir.clone()));
-                        }
-
-                        records.push(NativeRecord {
-                            source_id,
-                            updated_at: line_ts,
-                            payload: Value::Object(obj),
-                        });
-                    }
-                    _ => {}
-                }
-            }
-
-            records
-        })
+        .flat_map(|path| parse_pi_file(path, None, parsed_cursor.as_ref()).records)
         .collect();
-
     out.sort_by(|a, b| {
         a.updated_at
             .cmp(&b.updated_at)
@@ -313,6 +177,182 @@ fn load_pi_jsonl(
     });
     debug!(total = out.len(), "pi jsonl loaded");
     Ok(out)
+}
+
+fn parse_pi_file(
+    path: &str,
+    checkpoint: Option<&FileTail>,
+    legacy_cursor: Option<&ParsedCursor>,
+) -> FileParseResult {
+    let Some(opened) = adapter_common::open_jsonl(path, checkpoint) else {
+        return FileParseResult::default();
+    };
+    let JsonlResume::Open(opened, kind) = opened else {
+        // Unchanged file: reuse the stored checkpoint as the new tail state.
+        return FileParseResult {
+            records: Vec::new(),
+            tail: checkpoint.cloned(),
+        };
+    };
+    let adapter_common::OpenedJsonl {
+        mut reader,
+        size,
+        mtime: file_mtime,
+    } = opened;
+
+    let mut ctx = match kind {
+        ResumeKind::FromOffset => checkpoint.map(|cp| cp.ctx.clone()).unwrap_or_default(),
+        ResumeKind::Full => TailContext::default(),
+    };
+    // The legacy composite filter only applies when we have no per-file
+    // checkpoint (first sync after upgrade); tail/full re-parses emit
+    // everything and rely on idempotent upserts instead.
+    let legacy = if checkpoint.is_none() {
+        legacy_cursor
+    } else {
+        None
+    };
+
+    let mut session_id = ctx.session_id.take().unwrap_or_default();
+    let mut session_ts = ctx.session_ts.as_ref().and_then(|s| parse_rfc3339(s));
+    let mut cwd = ctx.cwd.take();
+    let mut first_user_text = ctx.first_user_text.take();
+    let mut records = Vec::new();
+    let mut msg_index = ctx.msg_index as usize;
+
+    for line in (&mut reader).lines().map_while(Result::ok) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(val): Result<Value, _> = serde_json::from_str(trimmed) else {
+            continue;
+        };
+
+        let line_type = val.get("type").and_then(Value::as_str).unwrap_or("");
+        let line_ts = val
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(parse_rfc3339)
+            .or(Some(file_mtime))
+            .unwrap_or_else(Utc::now);
+
+        match line_type {
+            "session" => {
+                if let Some(id) = val.get("id").and_then(Value::as_str) {
+                    session_id = id.to_string();
+                }
+                if let Some(dir) = val.get("cwd").and_then(Value::as_str) {
+                    cwd = Some(dir.to_string());
+                }
+                if session_ts.is_none() {
+                    session_ts = Some(line_ts);
+                }
+            }
+            "message" => {
+                let Some(msg) = val.get("message") else {
+                    continue;
+                };
+                let role = msg.get("role").and_then(Value::as_str).unwrap_or("user");
+
+                let content_text = extract_message_content(role, msg.get("content"));
+                if content_text.is_empty() {
+                    continue;
+                }
+
+                let mapped_role = match role {
+                    "user" => "user",
+                    _ => "assistant",
+                };
+
+                if mapped_role == "user" && first_user_text.is_none() {
+                    first_user_text = Some(content_text.clone());
+                }
+
+                let sid = if session_id.is_empty() {
+                    std::path::Path::new(path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(path)
+                        .to_string()
+                } else {
+                    session_id.clone()
+                };
+                let tool_result_id = (role == "toolResult").then(|| {
+                    val.get("id")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(ToOwned::to_owned)
+                        .unwrap_or_else(|| deterministic_id(&[path, trimmed]))
+                });
+                let source_id = format_pi_source_id(&sid, msg_index, tool_result_id.as_deref());
+                msg_index += 1;
+
+                if let Some(cur) = legacy
+                    && adapter_common::should_skip(line_ts, &source_id, cur)
+                {
+                    continue;
+                }
+
+                let title = first_user_text
+                    .as_deref()
+                    .map(|t| {
+                        if t.chars().count() > 80 {
+                            format!("{}…", t.chars().take(80).collect::<String>())
+                        } else {
+                            t.to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| sid.clone());
+
+                let mut obj = serde_json::Map::new();
+                obj.insert("role".to_string(), Value::String(role.to_string()));
+                if let Some(content) = msg.get("content") {
+                    obj.insert("content".to_string(), content.clone());
+                } else {
+                    obj.insert("content".to_string(), Value::Array(vec![]));
+                }
+                obj.insert("__thread_id".to_string(), Value::String(sid.clone()));
+                obj.insert("__thread_title".to_string(), Value::String(title));
+                if let Some(ts) = session_ts {
+                    obj.insert("__thread_ts".to_string(), Value::String(ts.to_rfc3339()));
+                }
+                obj.insert("__source_path".to_string(), Value::String(path.to_string()));
+                if let Some(ref dir) = cwd {
+                    obj.insert("__workspace_path".to_string(), Value::String(dir.clone()));
+                }
+
+                records.push(NativeRecord {
+                    source_id,
+                    updated_at: line_ts,
+                    payload: Value::Object(obj),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let offset = reader.stream_position().unwrap_or(size);
+    let mut raw = reader.into_inner();
+    let anchor = adapter_common::compute_tail_anchor(&mut raw, offset);
+    let tail = FileTail {
+        offset,
+        mtime: file_mtime,
+        anchor,
+        ctx: TailContext {
+            session_id: Some(session_id),
+            session_ts: session_ts.map(|t| t.to_rfc3339()),
+            session_title: None,
+            cwd,
+            first_user_text,
+            msg_index: msg_index as u64,
+        },
+    };
+
+    FileParseResult {
+        records,
+        tail: Some(tail),
+    }
 }
 
 fn normalize_records(records: &[NativeRecord]) -> NormalizedBatch {
@@ -417,6 +457,7 @@ fn normalize_records(records: &[NativeRecord]) -> NormalizedBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
 
     fn tempdir() -> std::path::PathBuf {
@@ -666,5 +707,98 @@ mod tests {
 
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].source_id, "sess-pi-5:00000000000000000003");
+    }
+
+    #[test]
+    fn tail_resume_emits_only_appended_messages() {
+        let dir = tempdir();
+        let path = write_session(
+            &dir,
+            &[
+                r#"{"type":"session","version":3,"id":"sess-t1","timestamp":"2026-02-08T10:54:12.530Z","cwd":"/tmp"}"#,
+                r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-02-08T10:55:00.000Z","message":{"role":"user","content":[{"type":"text","text":"hello"}]}}"#,
+            ],
+        );
+
+        let first = parse_pi_file(&path, None, None);
+        assert_eq!(first.records.len(), 1);
+        assert_eq!(first.records[0].source_id, "sess-t1:00000000000000000000");
+        let tail = first.tail.unwrap();
+
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let line = r#"{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-02-08T10:55:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"world"}]}}"#;
+        writeln!(f, "{line}").unwrap();
+        drop(f);
+
+        let second = parse_pi_file(&path, Some(&tail), None);
+        assert_eq!(second.records.len(), 1);
+        assert_eq!(second.records[0].source_id, "sess-t1:00000000000000000001");
+        assert_eq!(
+            second.records[0]
+                .payload
+                .get("__thread_title")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            second.records[0]
+                .payload
+                .get("__workspace_path")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "/tmp"
+        );
+
+        // Unchanged: third parse skips entirely but keeps the checkpoint.
+        let third = parse_pi_file(&path, second.tail.as_ref(), None);
+        assert!(third.records.is_empty());
+        assert!(third.tail.is_some());
+    }
+
+    #[test]
+    fn tail_rewrite_forces_full_reparse() {
+        let dir = tempdir();
+        let path = write_session(
+            &dir,
+            &[
+                r#"{"type":"session","version":3,"id":"sess-t2","timestamp":"2026-02-08T10:54:12.530Z","cwd":"/tmp"}"#,
+                r#"{"type":"message","id":"m1","parentId":null,"timestamp":"2026-02-08T10:55:00.000Z","message":{"role":"user","content":[{"type":"text","text":"original"}]}}"#,
+            ],
+        );
+
+        let first = parse_pi_file(&path, None, None);
+        assert_eq!(first.records.len(), 1);
+        let tail = first.tail.unwrap();
+
+        // Rewrite the file with different (larger) content.
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"session","version":3,"id":"sess-t2","timestamp":"2026-02-08T10:54:12.530Z","cwd":"/tmp"}"#,
+                "\n",
+                r#"{"type":"message","id":"r1","parentId":null,"timestamp":"2026-02-08T11:00:00.000Z","message":{"role":"user","content":[{"type":"text","text":"rewritten"}]}}"#,
+                "\n",
+                r#"{"type":"message","id":"r2","parentId":"r1","timestamp":"2026-02-08T11:00:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"replacement"}]}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let second = parse_pi_file(&path, Some(&tail), None);
+        assert_eq!(second.records.len(), 2);
+        assert_eq!(second.records[0].source_id, "sess-t2:00000000000000000000");
+        assert_eq!(second.records[1].source_id, "sess-t2:00000000000000000001");
+        assert_eq!(
+            second.records[0]
+                .payload
+                .get("__thread_title")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            "rewritten"
+        );
     }
 }

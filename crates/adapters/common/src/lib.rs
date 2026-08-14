@@ -1,8 +1,15 @@
-use std::{collections::HashMap, fs, io::BufRead, path::Path, time::SystemTime};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs,
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    path::Path,
+    time::SystemTime,
+};
 
 use chrono::{DateTime, TimeZone, Utc};
 use core_model::{AgentKind, NativeRecord, NormalizedBatch, deterministic_id};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, instrument, trace, warn};
 
@@ -32,6 +39,209 @@ pub fn collect_files_with_ext(root: &Path, ext: &str) -> Vec<String> {
 pub fn file_mtime(path: &str) -> Option<DateTime<Utc>> {
     let modified: SystemTime = fs::metadata(path).ok()?.modified().ok()?;
     Some(DateTime::<Utc>::from(modified))
+}
+
+/// Tail-cursor state for one JSONL file. Persisted inside the per-agent
+/// checkpoint as part of a `BTreeMap<path, FileTail>`; on the next sync the
+/// adapter resumes parsing from `offset` (the byte position after the last
+/// consumed line) when the size/mtime guard says the prefix is untouched.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FileTail {
+    /// Byte offset where the next sync should resume parsing (== the file
+    /// size at the end of the last parse for a cleanly-terminated file).
+    pub offset: u64,
+    /// File mtime at the end of the last parse.
+    pub mtime: DateTime<Utc>,
+    /// blake3 hash of the last `TAIL_ANCHOR_WINDOW` bytes before `offset`;
+    /// verified on the grew-path to detect in-place rewrites.
+    pub anchor: String,
+    /// Parse state (session identity, ordinal counters, …) required to resume
+    /// mid-file with stable source_ids.
+    pub ctx: TailContext,
+}
+
+/// Adapter-specific parse state carried in the tail checkpoint so that a
+/// mid-file resume keeps session identity and message ordinals stable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TailContext {
+    pub session_id: Option<String>,
+    pub session_ts: Option<String>,
+    pub session_title: Option<String>,
+    pub cwd: Option<String>,
+    pub first_user_text: Option<String>,
+    pub msg_index: u64,
+}
+
+/// Result of parsing one JSONL file: the records to emit plus the new tail
+/// state for the checkpoint map (`None` drops the file from the map).
+#[derive(Debug, Default)]
+pub struct FileParseResult {
+    pub records: Vec<NativeRecord>,
+    pub tail: Option<FileTail>,
+}
+
+/// How a file should be (re)parsed this sync.
+pub enum JsonlResume {
+    /// File unchanged since the last sync (size+mtime match): skip entirely.
+    Skip,
+    /// File opened, positioned per `ResumeKind`.
+    Open(OpenedJsonl, ResumeKind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeKind {
+    /// Parse only from the checkpoint offset (append-only path).
+    FromOffset,
+    /// Parse the whole file.
+    Full,
+}
+
+pub struct OpenedJsonl {
+    pub reader: BufReader<fs::File>,
+    pub size: u64,
+    pub mtime: DateTime<Utc>,
+}
+
+/// Bytes of the pre-offset suffix hashed into `FileTail::anchor`.
+pub const TAIL_ANCHOR_WINDOW: u64 = 4096;
+
+#[derive(Serialize, Deserialize)]
+struct TailCursorEnvelope {
+    v: u32,
+    files: BTreeMap<String, FileTail>,
+}
+
+/// Parse a checkpoint cursor. Returns `Some(map)` for the per-file tail format
+/// and `None` for legacy composite cursors (or anything unparseable).
+pub fn parse_tail_cursor(cursor: Option<&str>) -> Option<BTreeMap<String, FileTail>> {
+    let cursor = cursor?;
+    let envelope: TailCursorEnvelope = serde_json::from_str(cursor).ok()?;
+    if envelope.v != 1 {
+        return None;
+    }
+    Some(envelope.files)
+}
+
+pub fn encode_tail_cursor(files: &BTreeMap<String, FileTail>) -> String {
+    serde_json::to_string(&TailCursorEnvelope {
+        v: 1,
+        files: files.clone(),
+    })
+    .expect("tail cursor is serializable")
+}
+
+/// Open a JSONL file applying the tail-cursor guard. Returns `None` when the
+/// file is unreadable (caller drops it from the checkpoint map).
+pub fn open_jsonl(path: &str, checkpoint: Option<&FileTail>) -> Option<JsonlResume> {
+    let meta = fs::metadata(path).ok()?;
+    let size = meta.len();
+    let mtime: DateTime<Utc> = meta.modified().ok()?.into();
+
+    let Some(cp) = checkpoint else {
+        return open_from(path, ResumeKind::Full, 0, size, mtime);
+    };
+
+    // Unchanged: size and mtime both match the recorded end state.
+    if size == cp.offset && mtime == cp.mtime {
+        return Some(JsonlResume::Skip);
+    }
+
+    // Grew: append-only if the pre-offset suffix still matches; otherwise the
+    // file was rewritten (possibly growing) and needs a full re-parse.
+    if size > cp.offset {
+        let mut file = fs::File::open(path).ok()?;
+        if compute_tail_anchor(&mut file, cp.offset) == cp.anchor {
+            return open_from(path, ResumeKind::FromOffset, cp.offset, size, mtime);
+        }
+    }
+
+    // Shrunk or in-place rewrite (same size, different mtime): full re-parse.
+    open_from(path, ResumeKind::Full, 0, size, mtime)
+}
+
+fn open_from(
+    path: &str,
+    kind: ResumeKind,
+    offset: u64,
+    size: u64,
+    mtime: DateTime<Utc>,
+) -> Option<JsonlResume> {
+    let mut file = fs::File::open(path).ok()?;
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    Some(JsonlResume::Open(
+        OpenedJsonl {
+            reader: BufReader::new(file),
+            size,
+            mtime,
+        },
+        kind,
+    ))
+}
+
+/// Hash the last `TAIL_ANCHOR_WINDOW` bytes ending at `offset` (the suffix a
+/// resumed parse implicitly trusts). Leaves the file position at `offset`.
+pub fn compute_tail_anchor(file: &mut fs::File, offset: u64) -> String {
+    let start = offset.saturating_sub(TAIL_ANCHOR_WINDOW);
+    let len = (offset - start) as usize;
+    let mut buf = vec![0u8; len];
+    if len > 0 {
+        if file.seek(SeekFrom::Start(start)).is_err() {
+            return String::new();
+        }
+        if file.read_exact(&mut buf).is_err() {
+            return String::new();
+        }
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&buf);
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Stream records from JSONL files into `tx` in parallel. Each file is parsed
+/// independently (tail-resume or full), results are emitted deterministically
+/// in `source_paths` order, and the aggregated per-file checkpoint map is
+/// returned as the new cursor. `parse_file` materializes at most one file at
+/// a time.
+pub fn stream_jsonl_sources<F>(
+    source_paths: &[String],
+    cursor: Option<&str>,
+    tx: &std::sync::mpsc::SyncSender<NativeRecord>,
+    parse_file: F,
+) -> anyhow::Result<Option<String>>
+where
+    F: Fn(&str, Option<&FileTail>, Option<&ParsedCursor>) -> FileParseResult + Sync,
+{
+    let tail_map = parse_tail_cursor(cursor);
+    let legacy_cursor = if tail_map.is_some() {
+        None
+    } else {
+        cursor.and_then(parse_cursor)
+    };
+
+    let results: Vec<(String, FileParseResult)> = source_paths
+        .par_iter()
+        .map(|path| {
+            let cp = tail_map.as_ref().and_then(|m| m.get(path));
+            let res = parse_file(path, cp, legacy_cursor.as_ref());
+            (path.clone(), res)
+        })
+        .collect();
+
+    let mut files: BTreeMap<String, FileTail> = BTreeMap::new();
+    for (path, res) in results {
+        if let Some(tail) = res.tail {
+            files.insert(path, tail);
+        }
+        for rec in res.records {
+            tx.send(rec)?;
+        }
+    }
+    // With no source paths there is nothing to observe; keep the stored
+    // checkpoint untouched rather than overwriting it with an empty map.
+    if source_paths.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(encode_tail_cursor(&files)))
 }
 
 #[instrument(skip(source_paths), fields(files = source_paths.len()))]
@@ -755,6 +965,166 @@ mod tests {
             .map(|f| Path::new(f).file_name().unwrap().to_str().unwrap())
             .collect();
         assert_eq!(names, vec!["a.jsonl", "b.jsonl", "c.jsonl"]);
+    }
+
+    #[test]
+    fn tail_cursor_roundtrip() {
+        let mut files = BTreeMap::new();
+        files.insert(
+            "/tmp/a.jsonl".to_string(),
+            FileTail {
+                offset: 123,
+                mtime: Utc::now(),
+                anchor: "deadbeef".to_string(),
+                ctx: TailContext {
+                    session_id: Some("s1".to_string()),
+                    msg_index: 7,
+                    ..Default::default()
+                },
+            },
+        );
+        files.insert(
+            "/tmp/b.jsonl".to_string(),
+            FileTail {
+                offset: 456,
+                mtime: Utc::now(),
+                anchor: "cafebabe".to_string(),
+                ctx: TailContext::default(),
+            },
+        );
+        let encoded = encode_tail_cursor(&files);
+        let parsed = parse_tail_cursor(Some(&encoded)).unwrap();
+        assert_eq!(parsed, files);
+        // Keys stay sorted so the encoding is deterministic.
+        let keys: Vec<&String> = parsed.keys().collect();
+        assert_eq!(
+            keys,
+            vec![&"/tmp/a.jsonl".to_string(), &"/tmp/b.jsonl".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_tail_cursor_rejects_legacy_composite() {
+        let cursor = "2025-01-15T10:30:00+00:00\x1fmy-id";
+        assert!(parse_tail_cursor(Some(cursor)).is_none());
+        assert!(parse_tail_cursor(None).is_none());
+        assert!(parse_tail_cursor(Some("not-json")).is_none());
+    }
+
+    #[test]
+    fn open_jsonl_unchanged_skips() {
+        let dir = tempdir();
+        let path = dir.join("s.jsonl");
+        std::fs::write(&path, "line1\nline2\n").unwrap();
+        let path_str = path.to_str().unwrap().to_string();
+
+        // First parse: full.
+        let full = open_jsonl(&path_str, None).unwrap();
+        let JsonlResume::Open(opened, ResumeKind::Full) = full else {
+            panic!("first open should be Full");
+        };
+        let mut reader = opened.reader;
+        let mut lines = Vec::new();
+        for line in reader.by_ref().lines().map_while(Result::ok) {
+            lines.push(line);
+        }
+        assert_eq!(lines, vec!["line1", "line2"]);
+        let offset = reader.stream_position().unwrap();
+        let mut raw = reader.into_inner();
+        let anchor = compute_tail_anchor(&mut raw, offset);
+        let mtime: DateTime<Utc> = fs::metadata(&path).unwrap().modified().unwrap().into();
+        let cp = FileTail {
+            offset,
+            mtime,
+            anchor,
+            ctx: TailContext::default(),
+        };
+
+        // Unchanged: skip.
+        let again = open_jsonl(&path_str, Some(&cp)).unwrap();
+        assert!(matches!(again, JsonlResume::Skip));
+
+        // Append: resume from offset.
+        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(f, "line3").unwrap();
+        drop(f);
+        let grew = open_jsonl(&path_str, Some(&cp)).unwrap();
+        let JsonlResume::Open(opened, ResumeKind::FromOffset) = grew else {
+            panic!("append should resume from offset");
+        };
+        let tail: Vec<String> = opened.reader.lines().map_while(Result::ok).collect();
+        assert_eq!(tail, vec!["line3"]);
+        assert!(opened.size > cp.offset);
+
+        // Truncate: full re-parse.
+        std::fs::write(&path, "only\n").unwrap();
+        let shrunk = open_jsonl(&path_str, Some(&cp)).unwrap();
+        let JsonlResume::Open(_, ResumeKind::Full) = shrunk else {
+            panic!("truncation should force full re-parse");
+        };
+    }
+
+    #[test]
+    fn open_jsonl_rewrite_with_same_size_forces_full() {
+        let dir = tempdir();
+        let path = dir.join("s.jsonl");
+        std::fs::write(&path, "aaa\n").unwrap();
+        let path_str = path.to_str().unwrap().to_string();
+        let mtime: DateTime<Utc> = fs::metadata(&path).unwrap().modified().unwrap().into();
+        let cp = FileTail {
+            offset: 4,
+            mtime,
+            anchor: "x".to_string(),
+            ctx: TailContext::default(),
+        };
+        // Same size, different bytes (mtime may be identical on coarse clocks;
+        // the size+mtime guard alone cannot see it, and same size never resumes).
+        std::fs::write(&path, "bbb\n").unwrap();
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), cp.offset);
+        let again = open_jsonl(&path_str, Some(&cp)).unwrap();
+        let JsonlResume::Open(_, ResumeKind::Full) = again else {
+            panic!("same-size rewrite should force full re-parse");
+        };
+    }
+
+    #[test]
+    fn open_jsonl_grew_with_changed_suffix_forces_full() {
+        let dir = tempdir();
+        let path = dir.join("s.jsonl");
+        std::fs::write(&path, "aaaa\n").unwrap();
+        let path_str = path.to_str().unwrap().to_string();
+        let mtime: DateTime<Utc> = fs::metadata(&path).unwrap().modified().unwrap().into();
+        // Record a checkpoint whose anchor does NOT match the current suffix:
+        // the file "grew" (size 5 -> 10) but the pre-offset bytes changed.
+        let cp = FileTail {
+            offset: 5,
+            mtime,
+            anchor: "wrong-anchor".to_string(),
+            ctx: TailContext::default(),
+        };
+        std::fs::write(&path, "bbbb\nccccc\n").unwrap();
+        let again = open_jsonl(&path_str, Some(&cp)).unwrap();
+        let JsonlResume::Open(_, ResumeKind::Full) = again else {
+            panic!("grew with changed suffix should force full re-parse");
+        };
+    }
+
+    #[test]
+    fn compute_tail_anchor_stable() {
+        let dir = tempdir();
+        let path = dir.join("s.jsonl");
+        std::fs::write(&path, "line1\nline2\n").unwrap();
+        let mut file = fs::File::open(&path).unwrap();
+        let a1 = compute_tail_anchor(&mut file, 12);
+        let a2 = compute_tail_anchor(&mut file, 12);
+        assert_eq!(a1, a2);
+        assert_eq!(a1.len(), 64); // blake3 hex
+        // File position is restored to `offset`.
+        assert_eq!(file.stream_position().unwrap(), 12);
+        // Zero-length suffix hashes deterministically too.
+        let mut file2 = fs::File::open(&path).unwrap();
+        let _ = compute_tail_anchor(&mut file2, 0);
     }
 
     fn tempdir() -> std::path::PathBuf {

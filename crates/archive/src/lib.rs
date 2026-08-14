@@ -24,7 +24,7 @@ pub struct ArchiveBundle {
 }
 
 pub fn archive_plan(
-    store: &SqliteStore,
+    store: &mut SqliteStore,
     older_than: Duration,
     keep_latest: usize,
 ) -> anyhow::Result<String> {

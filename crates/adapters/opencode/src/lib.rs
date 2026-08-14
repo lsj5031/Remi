@@ -40,13 +40,28 @@ impl AgentAdapter for OpenCodeAdapter {
         Ok(paths)
     }
 
-    fn scan_changes_since(
+    fn stream_changes_since(
         &self,
         source_paths: &[String],
         cursor: Option<&str>,
-    ) -> anyhow::Result<Vec<NativeRecord>> {
+        tx: std::sync::mpsc::SyncSender<NativeRecord>,
+    ) -> anyhow::Result<Option<String>> {
         debug!(files = source_paths.len(), cursor = ?cursor, "opencode scan starting");
-        load_message_json(source_paths, cursor)
+        // OpenCode's SQLite source keeps its own incremental cursor and the
+        // per-message JSON files are one record each, so records are loaded
+        // then streamed; normalize keeps the global session meta index. The
+        // composite cursor is computed from the max record emitted.
+        let mut best: Option<NativeRecord> = None;
+        for rec in load_message_json(source_paths, cursor)? {
+            if best.as_ref().is_none_or(|b| {
+                rec.updated_at > b.updated_at
+                    || (rec.updated_at == b.updated_at && rec.source_id > b.source_id)
+            }) {
+                best = Some(rec.clone());
+            }
+            tx.send(rec)?;
+        }
+        Ok(best.map(|r| adapter_common::encode_cursor(r.updated_at, &r.source_id)))
     }
 
     fn normalize(&self, records: &[NativeRecord]) -> anyhow::Result<NormalizedBatch> {
@@ -56,10 +71,6 @@ impl AgentAdapter for OpenCodeAdapter {
             records,
             cached_session_meta_index(),
         ))
-    }
-
-    fn checkpoint_cursor(&self, records: &[NativeRecord]) -> Option<String> {
-        adapter_common::checkpoint_cursor_from_records(records)
     }
 
     fn archive_capability(&self) -> ArchiveCapability {

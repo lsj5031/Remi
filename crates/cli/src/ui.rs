@@ -5,7 +5,6 @@ use std::{
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
-use core_model::{Message, Session};
 use fuzzy_matcher::{FuzzyMatcher, skim::SkimMatcherV2};
 use owo_colors::OwoColorize;
 use serde::Serialize;
@@ -54,14 +53,23 @@ pub fn build_session_displays(
     store: &SqliteStore,
     hits: &[search::SessionHit],
 ) -> anyhow::Result<Vec<SessionDisplay>> {
+    let ids: Vec<String> = hits.iter().map(|hit| hit.session_id.clone()).collect();
+    let summaries = store.get_session_summaries(&ids)?;
     let mut out = Vec::with_capacity(hits.len());
     for hit in hits {
-        let Some(session) = store.get_session(&hit.session_id)? else {
+        let Some(summary) = summaries.get(&hit.session_id) else {
             continue;
         };
-        let messages = store.get_session_messages(&hit.session_id)?;
-        let message_count = messages.len();
-        let title = session_title(&session, &messages);
+        let session = &summary.session;
+        let title = if session.title.trim().is_empty() {
+            summary
+                .first_user_message
+                .as_deref()
+                .map(|content| truncate_text(content, 60))
+                .unwrap_or_else(|| "Untitled session".to_string())
+        } else {
+            session.title.clone()
+        };
         let snippet = truncate_text(&hit.top_content, 140);
         let match_text = format!(
             "{} {} {} {}",
@@ -75,25 +83,13 @@ pub fn build_session_displays(
             title,
             agent: session.agent.as_str().to_string(),
             updated_at: session.updated_at,
-            message_count,
+            message_count: summary.message_count,
             snippet,
             score: hit.score,
             match_text,
         });
     }
     Ok(out)
-}
-
-pub fn session_title(session: &Session, messages: &[Message]) -> String {
-    let title = session.title.trim();
-    if !title.is_empty() {
-        return title.to_string();
-    }
-    messages
-        .iter()
-        .find(|m| m.role == "user")
-        .map(|m| truncate_text(&m.content, 60))
-        .unwrap_or_else(|| "Untitled session".to_string())
 }
 
 pub fn prompt_line(prompt: &str) -> anyhow::Result<String> {
@@ -320,4 +316,62 @@ pub fn resolve_output_dir(dir: Option<PathBuf>) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(&base)
         .with_context(|| format!("creating output dir {}", base.display()))?;
     Ok(base)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use core_model::{AgentKind, Message, NormalizedBatch};
+    use search::SessionHit;
+    use std::time::Instant;
+
+    fn bench_store(sessions: usize, msgs_per_session: usize) -> SqliteStore {
+        let mut store = SqliteStore::open(":memory:").unwrap();
+        store.init_schema().unwrap();
+        let now = Utc::now();
+        let mut batch = NormalizedBatch::default();
+        for s in 0..sessions {
+            batch.sessions.push(core_model::Session {
+                id: format!("s{s}"),
+                agent: AgentKind::Claude,
+                source_ref: format!("ref{s}"),
+                title: format!("session {s}"),
+                created_at: now,
+                updated_at: now,
+            });
+            for m in 0..msgs_per_session {
+                batch.messages.push(Message {
+                    id: format!("m{s}_{m}"),
+                    session_id: format!("s{s}"),
+                    role: if m % 2 == 0 { "user" } else { "assistant" }.to_string(),
+                    content: format!("benchmark message content number {m} with words"),
+                    ts: now,
+                });
+            }
+        }
+        store.save_batch(&batch).unwrap();
+        store
+    }
+
+    #[test]
+    #[ignore = "benchmark: run with -- --ignored --nocapture"]
+    fn bench_build_session_displays() {
+        let store = bench_store(200, 100);
+        let hits: Vec<SessionHit> = (0..20)
+            .map(|i| SessionHit {
+                session_id: format!("s{i}"),
+                top_message_id: format!("m{i}_0"),
+                top_content: "benchmark message content".to_string(),
+                score: 1.0 / (i as f32 + 1.0),
+            })
+            .collect();
+        let t = Instant::now();
+        let displays = build_session_displays(&store, &hits).unwrap();
+        println!(
+            "build_session_displays 20 sessions (200x100 msgs): {:?} -> {} displays",
+            t.elapsed(),
+            displays.len()
+        );
+    }
 }

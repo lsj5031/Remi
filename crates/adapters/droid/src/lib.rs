@@ -1,9 +1,16 @@
-use std::{fs, io::BufRead, path::PathBuf};
+use std::{
+    io::{BufRead, Seek},
+    path::PathBuf,
+};
 
+use adapter_common::{
+    FileParseResult, FileTail, JsonlResume, ParsedCursor, ResumeKind, TailContext,
+};
 use chrono::{DateTime, Utc};
 use core_model::{
     AgentAdapter, AgentKind, ArchiveCapability, NativeRecord, NormalizedBatch, deterministic_id,
 };
+#[cfg(test)]
 use rayon::prelude::*;
 use serde_json::Value;
 use tracing::debug;
@@ -30,20 +37,17 @@ impl AgentAdapter for DroidAdapter {
         Ok(out)
     }
 
-    fn scan_changes_since(
+    fn stream_changes_since(
         &self,
         source_paths: &[String],
         cursor: Option<&str>,
-    ) -> anyhow::Result<Vec<NativeRecord>> {
-        load_droid_jsonl(source_paths, cursor)
+        tx: std::sync::mpsc::SyncSender<NativeRecord>,
+    ) -> anyhow::Result<Option<String>> {
+        adapter_common::stream_jsonl_sources(source_paths, cursor, &tx, parse_droid_file)
     }
 
     fn normalize(&self, records: &[NativeRecord]) -> anyhow::Result<NormalizedBatch> {
         Ok(normalize_records(records))
-    }
-
-    fn checkpoint_cursor(&self, records: &[NativeRecord]) -> Option<String> {
-        adapter_common::checkpoint_cursor_from_records(records)
     }
 
     fn archive_capability(&self) -> ArchiveCapability {
@@ -98,6 +102,7 @@ fn has_only_tool_blocks(content: Option<&Value>) -> bool {
     })
 }
 
+#[cfg(test)]
 fn load_droid_jsonl(
     source_paths: &[String],
     cursor: Option<&str>,
@@ -105,168 +110,8 @@ fn load_droid_jsonl(
     let parsed_cursor = cursor.and_then(adapter_common::parse_cursor);
     let mut out: Vec<NativeRecord> = source_paths
         .par_iter()
-        .flat_map(|path| {
-            let file_mtime = adapter_common::file_mtime(path);
-            if let Some(ref cur) = parsed_cursor
-                && let Some(mtime) = file_mtime
-                && mtime <= cur.ts
-            {
-                return Vec::new();
-            }
-
-            let file = match fs::File::open(path) {
-                Ok(f) => f,
-                Err(_) => return Vec::new(),
-            };
-            let reader = std::io::BufReader::new(file);
-            let lines: Vec<String> = reader.lines().map_while(Result::ok).collect();
-            if lines.is_empty() {
-                return Vec::new();
-            }
-
-            let mut session_id = String::new();
-            let mut session_title: Option<String> = None;
-            let mut session_ts: Option<DateTime<Utc>> = None;
-            let mut cwd: Option<String> = None;
-            let mut first_user_text: Option<String> = None;
-            let mut records = Vec::new();
-            let mut msg_index = 0usize;
-
-            for line in &lines {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let Ok(val): Result<Value, _> = serde_json::from_str(trimmed) else {
-                    continue;
-                };
-
-                let line_type = val.get("type").and_then(Value::as_str).unwrap_or("");
-
-                match line_type {
-                    "session_start" => {
-                        if let Some(id) = val.get("id").and_then(Value::as_str) {
-                            session_id = id.to_string();
-                        }
-                        if let Some(st) = val.get("sessionTitle").and_then(Value::as_str)
-                            && !st.is_empty()
-                        {
-                            session_title = Some(st.to_string());
-                        }
-                        if session_title.is_none()
-                            && let Some(t) = val.get("title").and_then(Value::as_str)
-                            && !t.is_empty()
-                        {
-                            session_title = Some(t.to_string());
-                        }
-                        if let Some(dir) = val.get("cwd").and_then(Value::as_str) {
-                            cwd = Some(dir.to_string());
-                        }
-                        let header_ts = val
-                            .get("timestamp")
-                            .and_then(Value::as_str)
-                            .and_then(parse_rfc3339)
-                            .or(file_mtime);
-                        if session_ts.is_none() {
-                            session_ts = header_ts;
-                        }
-                    }
-                    "message" => {
-                        let Some(message) = val.get("message") else {
-                            continue;
-                        };
-                        let content = message.get("content");
-
-                        if has_only_tool_blocks(content) {
-                            continue;
-                        }
-
-                        let text = extract_text_only(content);
-                        if text.is_empty() {
-                            continue;
-                        }
-
-                        let role = message
-                            .get("role")
-                            .and_then(Value::as_str)
-                            .unwrap_or("user");
-
-                        if role == "user" && first_user_text.is_none() {
-                            first_user_text = Some(text.clone());
-                        }
-
-                        let line_ts = val
-                            .get("timestamp")
-                            .and_then(Value::as_str)
-                            .and_then(parse_rfc3339)
-                            .or(file_mtime)
-                            .unwrap_or_else(Utc::now);
-
-                        if session_ts.is_none() {
-                            session_ts = Some(line_ts);
-                        }
-
-                        let sid = if session_id.is_empty() {
-                            std::path::Path::new(path)
-                                .file_stem()
-                                .and_then(|s| s.to_str())
-                                .unwrap_or(path)
-                                .to_string()
-                        } else {
-                            session_id.clone()
-                        };
-                        let source_id = format!("{sid}:{msg_index}");
-                        msg_index += 1;
-
-                        if let Some(ref cur) = parsed_cursor
-                            && adapter_common::should_skip(line_ts, &source_id, cur)
-                        {
-                            continue;
-                        }
-
-                        let title = session_title
-                            .clone()
-                            .or_else(|| {
-                                first_user_text.as_deref().map(|t| {
-                                    if t.chars().count() > 80 {
-                                        format!("{}…", t.chars().take(80).collect::<String>())
-                                    } else {
-                                        t.to_string()
-                                    }
-                                })
-                            })
-                            .unwrap_or_else(|| sid.clone());
-
-                        let mut obj = serde_json::Map::new();
-                        obj.insert("role".to_string(), Value::String(role.to_string()));
-                        obj.insert(
-                            "content".to_string(),
-                            Value::Array(vec![Value::String(text)]),
-                        );
-                        obj.insert("__thread_id".to_string(), Value::String(sid.clone()));
-                        obj.insert("__thread_title".to_string(), Value::String(title));
-                        if let Some(ts) = session_ts {
-                            obj.insert("__thread_ts".to_string(), Value::String(ts.to_rfc3339()));
-                        }
-                        obj.insert("__source_path".to_string(), Value::String(path.clone()));
-                        if let Some(ref dir) = cwd {
-                            obj.insert("__workspace_path".to_string(), Value::String(dir.clone()));
-                        }
-
-                        records.push(NativeRecord {
-                            source_id,
-                            updated_at: line_ts,
-                            payload: Value::Object(obj),
-                        });
-                    }
-                    _ => {}
-                }
-            }
-
-            records
-        })
+        .flat_map(|path| parse_droid_file(path, None, parsed_cursor.as_ref()).records)
         .collect();
-
     out.sort_by(|a, b| {
         a.updated_at
             .cmp(&b.updated_at)
@@ -274,6 +119,199 @@ fn load_droid_jsonl(
     });
     debug!(total = out.len(), "droid jsonl loaded");
     Ok(out)
+}
+
+fn parse_droid_file(
+    path: &str,
+    checkpoint: Option<&FileTail>,
+    legacy_cursor: Option<&ParsedCursor>,
+) -> FileParseResult {
+    let Some(opened) = adapter_common::open_jsonl(path, checkpoint) else {
+        return FileParseResult::default();
+    };
+    let JsonlResume::Open(opened, kind) = opened else {
+        // Unchanged file: reuse the stored checkpoint as the new tail state.
+        return FileParseResult {
+            records: Vec::new(),
+            tail: checkpoint.cloned(),
+        };
+    };
+    let adapter_common::OpenedJsonl {
+        mut reader,
+        size,
+        mtime: file_mtime,
+    } = opened;
+
+    let mut ctx = match kind {
+        ResumeKind::FromOffset => checkpoint.map(|cp| cp.ctx.clone()).unwrap_or_default(),
+        ResumeKind::Full => TailContext::default(),
+    };
+    let legacy = if checkpoint.is_none() {
+        legacy_cursor
+    } else {
+        None
+    };
+
+    let mut session_id = ctx.session_id.take().unwrap_or_default();
+    let mut session_title = ctx.session_title.take();
+    let mut session_ts = ctx.session_ts.as_ref().and_then(|s| parse_rfc3339(s));
+    let mut cwd = ctx.cwd.take();
+    let mut first_user_text = ctx.first_user_text.take();
+    let mut records = Vec::new();
+    let mut msg_index = ctx.msg_index as usize;
+
+    for line in (&mut reader).lines().map_while(Result::ok) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(val): Result<Value, _> = serde_json::from_str(trimmed) else {
+            continue;
+        };
+
+        let line_type = val.get("type").and_then(Value::as_str).unwrap_or("");
+
+        match line_type {
+            "session_start" => {
+                if let Some(id) = val.get("id").and_then(Value::as_str) {
+                    session_id = id.to_string();
+                }
+                if let Some(st) = val.get("sessionTitle").and_then(Value::as_str)
+                    && !st.is_empty()
+                {
+                    session_title = Some(st.to_string());
+                }
+                if session_title.is_none()
+                    && let Some(t) = val.get("title").and_then(Value::as_str)
+                    && !t.is_empty()
+                {
+                    session_title = Some(t.to_string());
+                }
+                if let Some(dir) = val.get("cwd").and_then(Value::as_str) {
+                    cwd = Some(dir.to_string());
+                }
+                let header_ts = val
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(parse_rfc3339)
+                    .or(Some(file_mtime));
+                if session_ts.is_none() {
+                    session_ts = header_ts;
+                }
+            }
+            "message" => {
+                let Some(message) = val.get("message") else {
+                    continue;
+                };
+                let content = message.get("content");
+
+                if has_only_tool_blocks(content) {
+                    continue;
+                }
+
+                let text = extract_text_only(content);
+                if text.is_empty() {
+                    continue;
+                }
+
+                let role = message
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("user");
+
+                if role == "user" && first_user_text.is_none() {
+                    first_user_text = Some(text.clone());
+                }
+
+                let line_ts = val
+                    .get("timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(parse_rfc3339)
+                    .or(Some(file_mtime))
+                    .unwrap_or_else(Utc::now);
+
+                if session_ts.is_none() {
+                    session_ts = Some(line_ts);
+                }
+
+                let sid = if session_id.is_empty() {
+                    std::path::Path::new(path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(path)
+                        .to_string()
+                } else {
+                    session_id.clone()
+                };
+                let source_id = format!("{sid}:{msg_index}");
+                msg_index += 1;
+
+                if let Some(cur) = legacy
+                    && adapter_common::should_skip(line_ts, &source_id, cur)
+                {
+                    continue;
+                }
+
+                let title = session_title
+                    .clone()
+                    .or_else(|| {
+                        first_user_text.as_deref().map(|t| {
+                            if t.chars().count() > 80 {
+                                format!("{}…", t.chars().take(80).collect::<String>())
+                            } else {
+                                t.to_string()
+                            }
+                        })
+                    })
+                    .unwrap_or_else(|| sid.clone());
+
+                let mut obj = serde_json::Map::new();
+                obj.insert("role".to_string(), Value::String(role.to_string()));
+                obj.insert(
+                    "content".to_string(),
+                    Value::Array(vec![Value::String(text)]),
+                );
+                obj.insert("__thread_id".to_string(), Value::String(sid.clone()));
+                obj.insert("__thread_title".to_string(), Value::String(title));
+                if let Some(ts) = session_ts {
+                    obj.insert("__thread_ts".to_string(), Value::String(ts.to_rfc3339()));
+                }
+                obj.insert("__source_path".to_string(), Value::String(path.to_string()));
+                if let Some(ref dir) = cwd {
+                    obj.insert("__workspace_path".to_string(), Value::String(dir.clone()));
+                }
+
+                records.push(NativeRecord {
+                    source_id,
+                    updated_at: line_ts,
+                    payload: Value::Object(obj),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let offset = reader.stream_position().unwrap_or(size);
+    let mut raw = reader.into_inner();
+    let anchor = adapter_common::compute_tail_anchor(&mut raw, offset);
+    let tail = FileTail {
+        offset,
+        mtime: file_mtime,
+        anchor,
+        ctx: TailContext {
+            session_id: Some(session_id),
+            session_ts: session_ts.map(|t| t.to_rfc3339()),
+            session_title,
+            cwd,
+            first_user_text,
+            msg_index: msg_index as u64,
+        },
+    };
+
+    FileParseResult {
+        records,
+        tail: Some(tail),
+    }
 }
 
 fn normalize_records(records: &[NativeRecord]) -> NormalizedBatch {
@@ -384,6 +422,7 @@ fn normalize_records(records: &[NativeRecord]) -> NormalizedBatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Write;
 
     fn tempdir() -> std::path::PathBuf {

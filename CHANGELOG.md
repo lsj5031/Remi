@@ -5,16 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0] - 2026-08-14
 
 ### Added
 
 - Separate docs indexing/search via `remi docs index --root <PATH>` and `remi docs search <QUERY>`, stored in the same SQLite database as synced sessions.
 - Incremental docs reconciliation for rename/delete flows, plus file-policy enforcement for `.md`, `.markdown`, `.txt`, and `.rst` roots.
+- Per-file tail cursors for Pi/Codex/Droid JSONL transcripts: incremental syncs resume from a guarded byte offset instead of re-parsing the whole file.
+- Benchmark suite (`-- --ignored`) covering save_batch, docs re-index, session displays, and the full sync pipeline.
+- `docs/PERFORMANCE.md` with the measured profile and architecture roadmap.
 
 ### Changed
 
+- **Streaming ingest**: adapters stream records through a bounded channel; `sync_adapter` normalizes/saves in chunks. First-sync peak RSS drops ~46% and no longer scales with history size.
+- **External-content FTS5 for messages**: the duplicated content blob is dropped (only the inverted index remains), shrinking the database ~37% (measured 131 MB → 83 MB on a real corpus); unchanged-content re-syncs now skip FTS writes entirely.
+- Docs re-index is metadata-only for unchanged files (mtime+size guard) with batched upserts; session list rendering uses batched queries; archive planning preloads seen IDs; FTS sync drops the separate DELETE.
 - README, STATUS, and AGENTS project notes now document the docs-search workflow, file allowlist, and the separation between docs search and session search accurately.
+
+### Fixed
+
+- `delete_session_cascade` deletes FTS entries through the messages index (no full FTS scan); Claude keeps its global cross-tree dedupe in the streaming path; OpenCode's SQLite cursor and session-meta index are preserved.
 
 ## [0.1.2] - 2026-04-08
 

@@ -10,7 +10,7 @@ use chrono::{DateTime, Utc};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use ingest::SyncPhase;
 use render::HtmlSafety;
-use store_sqlite::SqliteStore;
+use store_sqlite::{DocUpsert, DocumentRecord, SqliteStore};
 use tracing::{debug, info, trace};
 
 #[cfg(feature = "semantic")]
@@ -546,7 +546,7 @@ fn main() -> anyhow::Result<()> {
                 debug!(older_than = %older_than, keep_latest, "archive plan parameters");
                 info!(older_than = %older_than, keep_latest, "planning archive");
                 let run_id =
-                    archive::archive_plan(&store, chrono::Duration::from_std(d)?, keep_latest)?;
+                    archive::archive_plan(&mut store, chrono::Duration::from_std(d)?, keep_latest)?;
                 let items = store.archive_items_for_run(&run_id)?;
                 info!(sessions = items.len(), elapsed = ?t.elapsed(), "sessions selected");
                 println!("plan {run_id}");
@@ -636,11 +636,8 @@ struct DocsIndexSummary {
 #[derive(Debug)]
 struct ScannedDoc {
     relative_path: String,
-    title: String,
     modified_at: DateTime<Utc>,
     size: i64,
-    content_hash: String,
-    content: String,
 }
 
 fn index_docs_root(root: &Path) -> anyhow::Result<DocsIndexSummary> {
@@ -676,34 +673,69 @@ fn index_docs_root_with_db(root: &Path, db_path: &Path) -> anyhow::Result<DocsIn
     let result = (|| -> anyhow::Result<DocsIndexSummary> {
         let mut indexed = 0usize;
         let mut updated = 0usize;
+        let mut errors = scan.errors;
+
+        let existing_by_path: std::collections::HashMap<String, DocumentRecord> = store
+            .get_documents_for_root(&sync.root_id)?
+            .into_iter()
+            .map(|doc| (doc.relative_path.clone(), doc))
+            .collect();
+
+        let mut changed: Vec<DocUpsert> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
 
         for doc in &scan.docs {
-            let existing = store.get_document_by_path(&sync.root_id, &doc.relative_path)?;
-            let unchanged = existing.as_ref().is_some_and(|existing| {
-                existing.modified_at == doc.modified_at
-                    && existing.size_bytes == doc.size
-                    && existing.content_hash == doc.content_hash
-            });
-
-            if !unchanged {
-                if existing.is_some() {
-                    updated += 1;
-                } else {
-                    indexed += 1;
-                }
+            let existing = existing_by_path.get(&doc.relative_path);
+            // Fast path: unchanged mtime+size skips reading and hashing the file.
+            if let Some(existing) = existing
+                && existing.modified_at == doc.modified_at
+                && existing.size_bytes == doc.size
+            {
+                seen.push(doc.relative_path.clone());
+                continue;
             }
 
-            store.upsert_document(
-                &sync.root_id,
-                &doc.relative_path,
-                &doc.title,
-                doc.modified_at,
-                doc.size,
-                &doc.content_hash,
-                &doc.content,
-                sync.generation,
-            )?;
+            let bytes = match fs::read(root.join(&doc.relative_path)) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    errors += 1;
+                    continue;
+                }
+            };
+            let content = match String::from_utf8(bytes) {
+                Ok(content) => content,
+                Err(_) => {
+                    errors += 1;
+                    continue;
+                }
+            };
+            let content_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
+            if let Some(existing) = existing
+                && existing.size_bytes == doc.size
+                && existing.content_hash == content_hash
+            {
+                seen.push(doc.relative_path.clone());
+                continue;
+            }
+
+            let title = doc_title(Path::new(&doc.relative_path), &content);
+            if existing.is_some() {
+                updated += 1;
+            } else {
+                indexed += 1;
+            }
+            changed.push(DocUpsert {
+                relative_path: doc.relative_path.clone(),
+                title,
+                modified_at: doc.modified_at,
+                size_bytes: doc.size,
+                content_hash,
+                content,
+            });
         }
+
+        store.upsert_documents_batch(&sync.root_id, sync.generation, &changed)?;
+        store.mark_documents_seen(&sync.root_id, sync.generation, &seen)?;
 
         let finalize = store.finalize_doc_sync(&sync.root_id, sync.generation)?;
         Ok(DocsIndexSummary {
@@ -711,7 +743,7 @@ fn index_docs_root_with_db(root: &Path, db_path: &Path) -> anyhow::Result<DocsIn
             updated,
             skipped: scan.skipped,
             deleted: finalize.deleted_documents,
-            errors: scan.errors,
+            errors,
         })
     })();
 
@@ -779,39 +811,20 @@ fn scan_docs_tree(root: &Path) -> anyhow::Result<DocsScan> {
                     continue;
                 }
             };
-            let bytes = match fs::read(&path) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    errors += 1;
-                    continue;
-                }
-            };
-            let content = match String::from_utf8(bytes) {
-                Ok(content) => content,
-                Err(_) => {
-                    errors += 1;
-                    continue;
-                }
-            };
             let relative_path = normalize_relative_path(root, &path)?;
-            let title = doc_title(&path, &content);
             let modified_at = metadata
                 .modified()
                 .map(DateTime::<Utc>::from)
                 .unwrap_or_else(|_| Utc::now());
-            let content_hash = blake3::hash(content.as_bytes()).to_hex().to_string();
             docs.push(ScannedDoc {
                 relative_path,
-                title,
                 modified_at,
                 size: metadata.len() as i64,
-                content_hash,
-                content,
             });
         }
     }
 
-    docs.sort_by_key(|doc| doc.relative_path.clone());
+    docs.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
 
     Ok(DocsScan {
         docs,
@@ -1078,6 +1091,7 @@ fn detect_model_path() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1161,5 +1175,148 @@ mod tests {
 
         let _ = fs::remove_file(&db_path);
         let _ = fs::remove_dir_all(&root);
+    }
+    #[test]
+    #[ignore = "benchmark: run with -- --ignored --nocapture"]
+    fn bench_docs_reindex() {
+        let root = temp_path("bench-docs-root", "");
+        let db_path = temp_path("bench-docs-db", ".sqlite");
+        fs::create_dir_all(&root).unwrap();
+        for i in 0..8000usize {
+            let dir = root.join(format!("d{}", i % 80));
+            fs::create_dir_all(&dir).unwrap();
+            let mut content = format!("# Doc {i}\n\nSome body text with token-{i}.\n\n");
+            for _p in 0..40 {
+                content.push_str("paragraph with repeated words and more indexing tokens\n");
+            }
+            fs::write(dir.join(format!("file-{i}.md")), content).unwrap();
+        }
+
+        let t = Instant::now();
+        let first = index_docs_root_with_db(&root, &db_path).unwrap();
+        println!(
+            "docs first index 8000 files: {:?} (indexed={} updated={})",
+            t.elapsed(),
+            first.indexed,
+            first.updated
+        );
+
+        let t = Instant::now();
+        let second = index_docs_root_with_db(&root, &db_path).unwrap();
+        println!(
+            "docs re-index no changes 8000 files: {:?} (indexed={} updated={})",
+            t.elapsed(),
+            second.indexed,
+            second.updated
+        );
+
+        let _ = fs::remove_file(&db_path);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    #[ignore = "benchmark: run with -- --ignored --nocapture"]
+    fn bench_pipeline_first_sync() {
+        let dir = temp_path("bench-pipeline", "");
+        let sessions_dir = dir.join(".pi").join("agent").join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        unsafe {
+            std::env::set_var("HOME", &dir);
+        }
+        for f in 0..50usize {
+            let file = sessions_dir.join(format!("session-{f}.jsonl"));
+            let mut content = format!(
+                r#"{{"type":"session","version":3,"id":"sess-{f}","timestamp":"2026-01-01T00:00:00.000Z","cwd":"/tmp"}}"#
+            );
+            content.push('\n');
+            for i in 0..2000usize {
+                let ts = format!(
+                    "2026-01-01T{:02}:{:02}:{:02}.000Z",
+                    i / 3600,
+                    (i / 60) % 60,
+                    i % 60
+                );
+                match i % 3 {
+                    0 => content.push_str(&format!(
+                        r#"{{"type":"message","id":"m{f}_{i}","parentId":null,"timestamp":"{ts}","message":{{"role":"user","content":[{{"type":"text","text":"benchmark user message number {i} with searchable words"}}]}}}}"#
+                    )),
+                    1 => content.push_str(&format!(
+                        r#"{{"type":"message","id":"m{f}_{i}","parentId":null,"timestamp":"{ts}","message":{{"role":"assistant","content":[{{"type":"text","text":"Looking into the codebase for issue {i}"}},{{"type":"toolCall","id":"call_{i}","name":"bash","arguments":{{"command":"cargo test"}}}}]}}}}"#
+                    )),
+                    _ => content.push_str(&format!(
+                        r#"{{"type":"message","id":"m{f}_{i}","parentId":null,"timestamp":"{ts}","message":{{"role":"toolResult","toolCallId":"call_{i}","toolName":"bash","content":[{{"type":"text","text":"test output line {i} all passed"}}]}}}}"#
+                    )),
+                }
+                content.push('\n');
+            }
+            fs::write(&file, content).unwrap();
+        }
+
+        let mut store = SqliteStore::open(":memory:").unwrap();
+        store.init_schema().unwrap();
+        let adapter = pi::PiAdapter;
+        let mut files = 0usize;
+        let mut phases: Vec<(&'static str, std::time::Duration)> = Vec::new();
+        let mut last = Instant::now();
+        let total = Instant::now();
+        let count = ingest::sync_adapter(&adapter, &mut store, |phase| {
+            let now = Instant::now();
+            let label = match &phase {
+                SyncPhase::Discovering => "discover",
+                SyncPhase::Scanning { file_count } => {
+                    files = *file_count;
+                    "scan"
+                }
+                SyncPhase::Normalizing { .. } => "normalize",
+                SyncPhase::Saving { .. } => "save",
+                SyncPhase::Done { .. } => "done",
+            };
+            phases.push((label, now.duration_since(last)));
+            last = now;
+        })
+        .unwrap();
+        println!(
+            "sync_adapter 100k msgs ({files} files): total {:?} records={count}",
+            total.elapsed()
+        );
+        for (label, d) in &phases {
+            println!("  {label}: {d:?}");
+        }
+
+        let sessions = store.list_sessions().unwrap();
+        println!("sessions in store: {}", sessions.len());
+
+        // Incremental sync: append one message per file, then re-sync. With
+        // per-file tail cursors only the appended lines are parsed.
+        for f in 0..50usize {
+            let file = sessions_dir.join(format!("session-{f}.jsonl"));
+            let mut handle = fs::OpenOptions::new().append(true).open(&file).unwrap();
+            let line = format!(
+                r#"{{"type":"message","id":"tail_{f}","parentId":null,"timestamp":"2026-01-02T00:00:00.000Z","message":{{"role":"user","content":[{{"type":"text","text":"incremental message {f}"}}]}}}}"#
+            );
+            writeln!(handle, "{line}").unwrap();
+        }
+        let t = Instant::now();
+        let count2 = ingest::sync_adapter(&adapter, &mut store, |_| {}).unwrap();
+        println!(
+            "sync_adapter incremental +1 msg/file: {:?} records={count2}",
+            t.elapsed()
+        );
+        let t = Instant::now();
+        let count3 = ingest::sync_adapter(&adapter, &mut store, |_| {}).unwrap();
+        println!(
+            "sync_adapter no-change re-sync: {:?} records={count3}",
+            t.elapsed()
+        );
+
+        let t = Instant::now();
+        let hits = store.search_substring("never_present_token", 20).unwrap();
+        println!(
+            "search_substring full-scan miss: {:?} -> {} hits",
+            t.elapsed(),
+            hits.len()
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

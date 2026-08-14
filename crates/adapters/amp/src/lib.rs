@@ -1,5 +1,6 @@
 use std::{collections::HashMap, fs, path::PathBuf};
 
+use adapter_common::ParsedCursor;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use core_model::{
     AgentAdapter, AgentKind, ArchiveCapability, NativeRecord, NormalizedBatch, Session,
@@ -24,20 +25,37 @@ impl AgentAdapter for AmpAdapter {
         Ok(paths)
     }
 
-    fn scan_changes_since(
+    fn stream_changes_since(
         &self,
         source_paths: &[String],
         cursor: Option<&str>,
-    ) -> anyhow::Result<Vec<NativeRecord>> {
-        load_thread_json(source_paths, cursor)
+        tx: std::sync::mpsc::SyncSender<NativeRecord>,
+    ) -> anyhow::Result<Option<String>> {
+        // Amp threads are whole-document JSON files; per-file mtime skip plus
+        // the composite cursor filter remain the fast path here (a byte offset
+        // is meaningless across a rewritten document).
+        let parsed_cursor = cursor.and_then(adapter_common::parse_cursor);
+        let batches: Vec<Vec<NativeRecord>> = source_paths
+            .par_iter()
+            .map(|path| parse_amp_file(path, parsed_cursor.as_ref()))
+            .collect();
+        let mut best: Option<NativeRecord> = None;
+        for batch in batches {
+            for rec in batch {
+                if best.as_ref().is_none_or(|b| {
+                    rec.updated_at > b.updated_at
+                        || (rec.updated_at == b.updated_at && rec.source_id > b.source_id)
+                }) {
+                    best = Some(rec.clone());
+                }
+                tx.send(rec)?;
+            }
+        }
+        Ok(best.map(|r| adapter_common::encode_cursor(r.updated_at, &r.source_id)))
     }
 
     fn normalize(&self, records: &[NativeRecord]) -> anyhow::Result<NormalizedBatch> {
         Ok(normalize_records(AgentKind::Amp, records))
-    }
-
-    fn checkpoint_cursor(&self, records: &[NativeRecord]) -> Option<String> {
-        adapter_common::checkpoint_cursor_from_records(records)
     }
 
     fn archive_capability(&self) -> ArchiveCapability {
@@ -152,6 +170,7 @@ fn normalize_records(kind: AgentKind, records: &[NativeRecord]) -> NormalizedBat
     batch
 }
 
+#[cfg(test)]
 fn load_thread_json(
     source_paths: &[String],
     cursor: Option<&str>,
@@ -159,98 +178,8 @@ fn load_thread_json(
     let parsed_cursor = cursor.and_then(adapter_common::parse_cursor);
     let mut out: Vec<NativeRecord> = source_paths
         .par_iter()
-        .flat_map(|path| {
-            let file_mtime = adapter_common::file_mtime(path);
-            if let Some(ref cur) = parsed_cursor
-                && let Some(mtime) = file_mtime
-                && mtime <= cur.ts
-            {
-                return Vec::new();
-            }
-
-            let Ok(content) = fs::read_to_string(path) else {
-                return Vec::new();
-            };
-            let Ok(val): Result<Value, _> = serde_json::from_str(&content) else {
-                return Vec::new();
-            };
-
-            let thread_id = parse_thread_id(&val, path);
-            let title = val
-                .get("title")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| thread_id.clone());
-            let thread_ts = extract_timestamp(&val).or_else(|| {
-                val.get("created")
-                    .or_else(|| val.get("createdAt"))
-                    .and_then(extract_timestamp)
-            });
-            let workspace_path = extract_workspace_path(&val);
-            let usage_index = build_usage_ledger_index(&val);
-
-            let messages = val.get("messages").and_then(Value::as_array);
-            let Some(messages) = messages else {
-                return Vec::new();
-            };
-
-            messages
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, message)| {
-                    let message_id = parse_message_id(message, idx, &thread_id);
-                    let ts = message_timestamp(
-                        message,
-                        &message_id,
-                        idx,
-                        thread_ts,
-                        file_mtime,
-                        &usage_index,
-                    );
-                    let source_id = format!("{thread_id}:{message_id}");
-                    if let Some(ref cur) = parsed_cursor
-                        && adapter_common::should_skip(ts, &source_id, cur)
-                    {
-                        return None;
-                    }
-
-                    let mut obj = serde_json::Map::new();
-                    if let Some(role) = message.get("role") {
-                        obj.insert("role".to_string(), role.clone());
-                    }
-                    if let Some(content) = message.get("content") {
-                        obj.insert("content".to_string(), content.clone());
-                    }
-                    if let Some(meta) = message.get("meta") {
-                        obj.insert("meta".to_string(), meta.clone());
-                    }
-                    obj.insert("messageId".to_string(), Value::String(message_id));
-                    obj.insert("__thread_id".to_string(), Value::String(thread_id.clone()));
-                    obj.insert("__thread_title".to_string(), Value::String(title.clone()));
-                    if let Some(thread_ts) = thread_ts {
-                        obj.insert(
-                            "__thread_ts".to_string(),
-                            Value::String(thread_ts.to_rfc3339()),
-                        );
-                    }
-                    obj.insert("__source_path".to_string(), Value::String(path.clone()));
-                    if let Some(workspace_path) = &workspace_path {
-                        obj.insert(
-                            "__workspace_path".to_string(),
-                            Value::String(workspace_path.clone()),
-                        );
-                    }
-
-                    Some(NativeRecord {
-                        source_id,
-                        updated_at: ts,
-                        payload: Value::Object(obj),
-                    })
-                })
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|path| parse_amp_file(path, parsed_cursor.as_ref()))
         .collect();
-
     out.sort_by(|a, b| {
         a.updated_at
             .cmp(&b.updated_at)
@@ -258,6 +187,97 @@ fn load_thread_json(
     });
     debug!(total = out.len(), "amp threads loaded");
     Ok(out)
+}
+
+fn parse_amp_file(path: &str, parsed_cursor: Option<&ParsedCursor>) -> Vec<NativeRecord> {
+    let file_mtime = adapter_common::file_mtime(path);
+    if let Some(cur) = parsed_cursor
+        && let Some(mtime) = file_mtime
+        && mtime <= cur.ts
+    {
+        return Vec::new();
+    }
+
+    let Ok(content) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(val): Result<Value, _> = serde_json::from_str(&content) else {
+        return Vec::new();
+    };
+
+    let thread_id = parse_thread_id(&val, path);
+    let title = val
+        .get("title")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| thread_id.clone());
+    let thread_ts = extract_timestamp(&val).or_else(|| {
+        val.get("created")
+            .or_else(|| val.get("createdAt"))
+            .and_then(extract_timestamp)
+    });
+    let workspace_path = extract_workspace_path(&val);
+    let usage_index = build_usage_ledger_index(&val);
+
+    let messages = val.get("messages").and_then(Value::as_array);
+    let Some(messages) = messages else {
+        return Vec::new();
+    };
+
+    messages
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, message)| {
+            let message_id = parse_message_id(message, idx, &thread_id);
+            let ts = message_timestamp(
+                message,
+                &message_id,
+                idx,
+                thread_ts,
+                file_mtime,
+                &usage_index,
+            );
+            let source_id = format!("{thread_id}:{message_id}");
+            if let Some(cur) = parsed_cursor
+                && adapter_common::should_skip(ts, &source_id, cur)
+            {
+                return None;
+            }
+
+            let mut obj = serde_json::Map::new();
+            if let Some(role) = message.get("role") {
+                obj.insert("role".to_string(), role.clone());
+            }
+            if let Some(content) = message.get("content") {
+                obj.insert("content".to_string(), content.clone());
+            }
+            if let Some(meta) = message.get("meta") {
+                obj.insert("meta".to_string(), meta.clone());
+            }
+            obj.insert("messageId".to_string(), Value::String(message_id));
+            obj.insert("__thread_id".to_string(), Value::String(thread_id.clone()));
+            obj.insert("__thread_title".to_string(), Value::String(title.clone()));
+            if let Some(thread_ts) = thread_ts {
+                obj.insert(
+                    "__thread_ts".to_string(),
+                    Value::String(thread_ts.to_rfc3339()),
+                );
+            }
+            obj.insert("__source_path".to_string(), Value::String(path.to_string()));
+            if let Some(workspace_path) = &workspace_path {
+                obj.insert(
+                    "__workspace_path".to_string(),
+                    Value::String(workspace_path.clone()),
+                );
+            }
+
+            Some(NativeRecord {
+                source_id,
+                updated_at: ts,
+                payload: Value::Object(obj),
+            })
+        })
+        .collect()
 }
 
 fn parse_thread_id(thread: &Value, path: &str) -> String {

@@ -142,17 +142,40 @@ pub enum ArchiveCapability {
     CentralizedCopy,
 }
 
-pub trait AgentAdapter {
+pub trait AgentAdapter: Send + Sync {
     fn kind(&self) -> AgentKind;
     fn discover_source_paths(&self) -> anyhow::Result<Vec<String>>;
+    /// Stream changed records into `tx`. Backpressure from the bounded channel
+    /// keeps peak memory flat while parsing stays parallel. Adapters may keep
+    /// global state internally (e.g. cross-file dedupe) but should avoid
+    /// materializing every record up front where possible.
+    ///
+    /// Returns the *new* checkpoint cursor to persist (replacing the stored
+    /// one), or `None` to keep the existing checkpoint unchanged.
+    fn stream_changes_since(
+        &self,
+        source_paths: &[String],
+        cursor: Option<&str>,
+        tx: std::sync::mpsc::SyncSender<NativeRecord>,
+    ) -> anyhow::Result<Option<String>>;
+    fn normalize(&self, records: &[NativeRecord]) -> anyhow::Result<NormalizedBatch>;
+    fn archive_capability(&self) -> ArchiveCapability;
+    /// Collect all changed records (compatibility shim over the streaming path).
     fn scan_changes_since(
         &self,
         source_paths: &[String],
         cursor: Option<&str>,
-    ) -> anyhow::Result<Vec<NativeRecord>>;
-    fn normalize(&self, records: &[NativeRecord]) -> anyhow::Result<NormalizedBatch>;
-    fn checkpoint_cursor(&self, records: &[NativeRecord]) -> Option<String>;
-    fn archive_capability(&self) -> ArchiveCapability;
+    ) -> anyhow::Result<Vec<NativeRecord>> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(64);
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| self.stream_changes_since(source_paths, cursor, tx));
+            let out: Vec<NativeRecord> = rx.into_iter().collect();
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("adapter scan thread panicked"))??;
+            Ok(out)
+        })
+    }
 }
 
 pub fn deterministic_id(parts: &[&str]) -> String {

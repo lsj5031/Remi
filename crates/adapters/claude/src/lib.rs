@@ -33,111 +33,26 @@ impl AgentAdapter for ClaudeAdapter {
         Ok(out)
     }
 
-    fn scan_changes_since(
+    fn stream_changes_since(
         &self,
         source_paths: &[String],
         cursor: Option<&str>,
-    ) -> anyhow::Result<Vec<NativeRecord>> {
-        let parsed_cursor = cursor.and_then(adapter_common::parse_cursor);
-        let candidates: Vec<CandidateRecord> = source_paths
-            .par_iter()
-            .flat_map(|path| {
-                let file_mtime = adapter_common::file_mtime(path);
-                if let Some(ref cur) = parsed_cursor
-                    && let Some(mtime) = file_mtime
-                    && mtime <= cur.ts
-                {
-                    return Vec::new();
-                }
-
-                let source_kind = source_kind(path);
-                let priority = source_priority(source_kind);
-                let stem = std::path::Path::new(path)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(path)
-                    .to_string();
-
-                let Ok(content) = fs::read_to_string(path) else {
-                    return Vec::new();
-                };
-
-                content
-                    .lines()
-                    .enumerate()
-                    .filter_map(|(line_idx, line)| {
-                        if line.trim().is_empty() {
-                            return None;
-                        }
-
-                        let line_number = line_idx + 1;
-                        let mut val: Value = serde_json::from_str(line).ok()?;
-                        let ts = adapter_common::extract_ts(&val)
-                            .or(file_mtime)
-                            .unwrap_or_else(chrono::Utc::now);
-
-                        let source_id = extract_message_identity(&val).unwrap_or_else(|| {
-                            deterministic_id(&["claude", path, &line_number.to_string(), line])
-                        });
-                        if let Some(ref cur) = parsed_cursor
-                            && adapter_common::should_skip(ts, &source_id, cur)
-                        {
-                            return None;
-                        }
-
-                        let session_key = resolve_session_key(&val, Some(path), &source_id);
-
-                        if let Some(obj) = val.as_object_mut() {
-                            obj.insert("__source_path".to_string(), Value::String(path.clone()));
-                            obj.insert("__session_seed".to_string(), Value::String(stem.clone()));
-                            obj.insert(
-                                "__session_key".to_string(),
-                                Value::String(session_key.clone()),
-                            );
-                            obj.insert(
-                                "__source_priority".to_string(),
-                                Value::Number(serde_json::Number::from(priority)),
-                            );
-                        }
-
-                        let dedupe_key = dedupe_key(&val, ts, &session_key, line_number);
-                        let richness = payload_richness(&val);
-
-                        Some(CandidateRecord {
-                            dedupe_key,
-                            priority,
-                            richness,
-                            record: NativeRecord {
-                                source_id,
-                                updated_at: ts,
-                                payload: val,
-                            },
-                        })
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-
-        let mut deduped: HashMap<String, CandidateRecord> = HashMap::new();
-        for candidate in candidates {
-            deduped
-                .entry(candidate.dedupe_key.clone())
-                .and_modify(|existing| {
-                    if should_replace(existing, &candidate) {
-                        *existing = candidate.clone();
-                    }
-                })
-                .or_insert(candidate);
+        tx: std::sync::mpsc::SyncSender<NativeRecord>,
+    ) -> anyhow::Result<Option<String>> {
+        // Claude dedupes globally across source trees before emitting, so
+        // candidates are materialized once; only the output is streamed.
+        // The composite cursor is computed from the max record emitted.
+        let mut best: Option<NativeRecord> = None;
+        for rec in scan_claude_sources(source_paths, cursor)? {
+            if best.as_ref().is_none_or(|b| {
+                rec.updated_at > b.updated_at
+                    || (rec.updated_at == b.updated_at && rec.source_id > b.source_id)
+            }) {
+                best = Some(rec.clone());
+            }
+            tx.send(rec)?;
         }
-
-        let mut out: Vec<NativeRecord> = deduped.into_values().map(|c| c.record).collect();
-        out.sort_by(|a, b| {
-            a.updated_at
-                .cmp(&b.updated_at)
-                .then_with(|| a.source_id.cmp(&b.source_id))
-        });
-        debug!(total = out.len(), "claude scan complete");
-        Ok(out)
+        Ok(best.map(|r| adapter_common::encode_cursor(r.updated_at, &r.source_id)))
     }
 
     fn normalize(&self, records: &[NativeRecord]) -> anyhow::Result<NormalizedBatch> {
@@ -145,13 +60,115 @@ impl AgentAdapter for ClaudeAdapter {
         normalize_records(AgentKind::Claude, records)
     }
 
-    fn checkpoint_cursor(&self, records: &[NativeRecord]) -> Option<String> {
-        adapter_common::checkpoint_cursor_from_records(records)
-    }
-
     fn archive_capability(&self) -> ArchiveCapability {
         ArchiveCapability::CentralizedCopy
     }
+}
+
+fn scan_claude_sources(
+    source_paths: &[String],
+    cursor: Option<&str>,
+) -> anyhow::Result<Vec<NativeRecord>> {
+    let parsed_cursor = cursor.and_then(adapter_common::parse_cursor);
+    let candidates: Vec<CandidateRecord> = source_paths
+        .par_iter()
+        .flat_map(|path| {
+            let file_mtime = adapter_common::file_mtime(path);
+            if let Some(ref cur) = parsed_cursor
+                && let Some(mtime) = file_mtime
+                && mtime <= cur.ts
+            {
+                return Vec::new();
+            }
+
+            let source_kind = source_kind(path);
+            let priority = source_priority(source_kind);
+            let stem = std::path::Path::new(path)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(path)
+                .to_string();
+
+            let Ok(content) = fs::read_to_string(path) else {
+                return Vec::new();
+            };
+
+            content
+                .lines()
+                .enumerate()
+                .filter_map(|(line_idx, line)| {
+                    if line.trim().is_empty() {
+                        return None;
+                    }
+
+                    let line_number = line_idx + 1;
+                    let mut val: Value = serde_json::from_str(line).ok()?;
+                    let ts = adapter_common::extract_ts(&val)
+                        .or(file_mtime)
+                        .unwrap_or_else(chrono::Utc::now);
+
+                    let source_id = extract_message_identity(&val).unwrap_or_else(|| {
+                        deterministic_id(&["claude", path, &line_number.to_string(), line])
+                    });
+                    if let Some(ref cur) = parsed_cursor
+                        && adapter_common::should_skip(ts, &source_id, cur)
+                    {
+                        return None;
+                    }
+
+                    let session_key = resolve_session_key(&val, Some(path), &source_id);
+
+                    if let Some(obj) = val.as_object_mut() {
+                        obj.insert("__source_path".to_string(), Value::String(path.clone()));
+                        obj.insert("__session_seed".to_string(), Value::String(stem.clone()));
+                        obj.insert(
+                            "__session_key".to_string(),
+                            Value::String(session_key.clone()),
+                        );
+                        obj.insert(
+                            "__source_priority".to_string(),
+                            Value::Number(serde_json::Number::from(priority)),
+                        );
+                    }
+
+                    let dedupe_key = dedupe_key(&val, ts, &session_key, line_number);
+                    let richness = payload_richness(&val);
+
+                    Some(CandidateRecord {
+                        dedupe_key,
+                        priority,
+                        richness,
+                        record: NativeRecord {
+                            source_id,
+                            updated_at: ts,
+                            payload: val,
+                        },
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+
+    let mut deduped: HashMap<String, CandidateRecord> = HashMap::new();
+    for candidate in candidates {
+        deduped
+            .entry(candidate.dedupe_key.clone())
+            .and_modify(|existing| {
+                if should_replace(existing, &candidate) {
+                    *existing = candidate.clone();
+                }
+            })
+            .or_insert(candidate);
+    }
+
+    let mut out: Vec<NativeRecord> = deduped.into_values().map(|c| c.record).collect();
+    out.sort_by(|a, b| {
+        a.updated_at
+            .cmp(&b.updated_at)
+            .then_with(|| a.source_id.cmp(&b.source_id))
+    });
+    debug!(total = out.len(), "claude scan complete");
+    Ok(out)
 }
 
 #[derive(Clone)]
