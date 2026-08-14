@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-08-14
+
+### Fixed
+
+- The `semantic` feature never compiled: the ingest loop moved the `Option<&mut Embedder>` into `save_chunk` (E0382), two `std::env::set_var` calls were unsafe under edition 2024 (E0133), and a clippy `collapsible_if` lint blocked `-D warnings`. `remi embed` and `--semantic` search are now buildable and verified end-to-end against a downloaded ONNX Runtime + BGE model.
+- Integration tests hard-coded the Linux XDG data layout, so they seeded a database the app never opened on macOS (`doctor`, session JSON search, and docs re-index all failed there). Tests now mirror `dirs::data_dir()` per platform; the full suite is green on macOS.
+
+### Changed
+
+- The bundled Linux release asset is now built with `--features semantic`, so the artifact that ships the ONNX Runtime + model actually contains a `remi embed` that can run offline.
+
 ## [0.2.1] - 2026-08-14
 
 ### Changed

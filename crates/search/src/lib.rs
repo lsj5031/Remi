@@ -118,7 +118,7 @@ pub fn search(
     #[cfg(feature = "semantic")]
     let semantic_rows = if let Some(embedder) = embedder {
         let query_vec = embedder.embed(query, true)?;
-        let mut owned_embeddings = None;
+        let owned_embeddings;
         let embeddings = if let Some(cache) = cache {
             cache.embeddings(store)?
         } else {

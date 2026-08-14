@@ -22,14 +22,41 @@ fn fresh_data_home() -> PathBuf {
     path
 }
 
+/// The directory `dirs::data_dir()` resolves to for the child process given the
+/// env vars `remi_cmd` sets. macOS and Windows ignore the XDG vars, so the
+/// tests must mirror each platform's convention or they seed a DB the app
+/// never opens (the cause of the pre-existing macOS-only failures).
+fn data_dir_for(home: &Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library").join("Application Support")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // `dirs::data_dir()` on Windows is %APPDATA% (Roaming).
+        std::env::var_os("APPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.to_path_buf())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        // `dirs::data_dir()` honors $XDG_DATA_HOME when set, else $HOME/.local/share.
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local").join("share"))
+    }
+}
+
 fn remi_cmd(data_home: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_remi"));
-    cmd.env("HOME", data_home).env("XDG_DATA_HOME", data_home);
+    cmd.env("HOME", data_home)
+        .env("XDG_DATA_HOME", data_home)
+        .env("APPDATA", data_home);
     cmd
 }
 
 fn seed_session_store(data_home: &Path, query_term: &str) {
-    let db_path = data_home.join("remi").join("remi.db");
+    let db_path = data_dir_for(data_home).join("remi").join("remi.db");
     fs::create_dir_all(db_path.parent().unwrap()).unwrap();
     let mut store = SqliteStore::open(&db_path).unwrap();
     store.init_schema().unwrap();
@@ -254,7 +281,7 @@ fn docs_index_updates_stay_store_searchable_and_write_rfc3339_timestamps() {
         String::from_utf8_lossy(&second.stderr)
     );
 
-    let db_path = data_home.join("remi").join("remi.db");
+    let db_path = data_dir_for(&data_home).join("remi").join("remi.db");
     let store = SqliteStore::open(&db_path).unwrap();
     let hits = store.search_documents_lexical("alpha", 10).unwrap();
     assert_eq!(hits.len(), 1, "hits={hits:?}");

@@ -18,7 +18,7 @@ const CHUNK: usize = 5000;
 pub fn sync_adapter(
     adapter: &dyn AgentAdapter,
     store: &mut SqliteStore,
-    #[cfg(feature = "semantic")] embedder: Option<&mut embeddings::Embedder>,
+    #[cfg(feature = "semantic")] mut embedder: Option<&mut embeddings::Embedder>,
     mut on_progress: impl FnMut(SyncPhase),
 ) -> anyhow::Result<usize> {
     on_progress(SyncPhase::Discovering);
@@ -49,7 +49,9 @@ pub fn sync_adapter(
                         adapter,
                         store,
                         #[cfg(feature = "semantic")]
-                        embedder,
+                        // Reborrow per chunk; `Option<&mut T>` is not Copy.
+                        #[allow(clippy::needless_option_as_deref)]
+                        embedder.as_deref_mut(),
                         &mut buf,
                         &mut on_progress,
                     )?;
@@ -60,7 +62,9 @@ pub fn sync_adapter(
                     adapter,
                     store,
                     #[cfg(feature = "semantic")]
-                    embedder,
+                    // Reborrow per chunk; `Option<&mut T>` is not Copy.
+                    #[allow(clippy::needless_option_as_deref)]
+                    embedder.as_deref_mut(),
                     &mut buf,
                     &mut on_progress,
                 )?;

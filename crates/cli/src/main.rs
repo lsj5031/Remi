@@ -887,7 +887,8 @@ fn configure_ort(cli: &Cli) -> anyhow::Result<()> {
         if !path.exists() {
             return Err(anyhow::anyhow!("ORT dylib not found at {}", path.display()));
         }
-        std::env::set_var("ORT_DYLIB_PATH", path);
+        // SAFETY: called once during startup, before any other threads exist.
+        unsafe { std::env::set_var("ORT_DYLIB_PATH", path) };
         return Ok(());
     }
 
@@ -897,7 +898,8 @@ fn configure_ort(cli: &Cli) -> anyhow::Result<()> {
         }
         if let Some(found) = find_ort_dylib()? {
             info!(path = %found.display(), "using ORT dylib");
-            std::env::set_var("ORT_DYLIB_PATH", found);
+            // SAFETY: called once during startup, before any other threads exist.
+            unsafe { std::env::set_var("ORT_DYLIB_PATH", found) };
         } else {
             tracing::warn!("failed to auto-detect libonnxruntime.so");
         }
@@ -1066,11 +1068,11 @@ fn sync_one(
 #[cfg(feature = "semantic")]
 fn detect_model_path() -> Option<PathBuf> {
     let mut candidates = Vec::new();
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("models").join("bge-small-en-v1.5"));
-            candidates.push(dir.join("model"));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.join("models").join("bge-small-en-v1.5"));
+        candidates.push(dir.join("model"));
     }
     if let Some(cache_dir) = dirs::cache_dir() {
         candidates.push(cache_dir.join("remi").join("bge-small-en-v1.5"));
@@ -1259,21 +1261,27 @@ mod tests {
         let mut phases: Vec<(&'static str, std::time::Duration)> = Vec::new();
         let mut last = Instant::now();
         let total = Instant::now();
-        let count = ingest::sync_adapter(&adapter, &mut store, |phase| {
-            let now = Instant::now();
-            let label = match &phase {
-                SyncPhase::Discovering => "discover",
-                SyncPhase::Scanning { file_count } => {
-                    files = *file_count;
-                    "scan"
-                }
-                SyncPhase::Normalizing { .. } => "normalize",
-                SyncPhase::Saving { .. } => "save",
-                SyncPhase::Done { .. } => "done",
-            };
-            phases.push((label, now.duration_since(last)));
-            last = now;
-        })
+        let count = ingest::sync_adapter(
+            &adapter,
+            &mut store,
+            #[cfg(feature = "semantic")]
+            None,
+            |phase| {
+                let now = Instant::now();
+                let label = match &phase {
+                    SyncPhase::Discovering => "discover",
+                    SyncPhase::Scanning { file_count } => {
+                        files = *file_count;
+                        "scan"
+                    }
+                    SyncPhase::Normalizing { .. } => "normalize",
+                    SyncPhase::Saving { .. } => "save",
+                    SyncPhase::Done { .. } => "done",
+                };
+                phases.push((label, now.duration_since(last)));
+                last = now;
+            },
+        )
         .unwrap();
         println!(
             "sync_adapter 100k msgs ({files} files): total {:?} records={count}",
@@ -1297,13 +1305,27 @@ mod tests {
             writeln!(handle, "{line}").unwrap();
         }
         let t = Instant::now();
-        let count2 = ingest::sync_adapter(&adapter, &mut store, |_| {}).unwrap();
+        let count2 = ingest::sync_adapter(
+            &adapter,
+            &mut store,
+            #[cfg(feature = "semantic")]
+            None,
+            |_| {},
+        )
+        .unwrap();
         println!(
             "sync_adapter incremental +1 msg/file: {:?} records={count2}",
             t.elapsed()
         );
         let t = Instant::now();
-        let count3 = ingest::sync_adapter(&adapter, &mut store, |_| {}).unwrap();
+        let count3 = ingest::sync_adapter(
+            &adapter,
+            &mut store,
+            #[cfg(feature = "semantic")]
+            None,
+            |_| {},
+        )
+        .unwrap();
         println!(
             "sync_adapter no-change re-sync: {:?} records={count3}",
             t.elapsed()

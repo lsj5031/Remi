@@ -39,6 +39,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist/bundled/bin dist/bundled/models dist/bundled/runtime
+          # The bundled asset ships the ONNX runtime + model, so the binary
+          # must be built with the semantic feature or `remi embed` would be
+          # absent from the one artifact that can run it offline.
+          cargo build -p cli --release --features semantic
           cp target/release/remi dist/bundled/bin/
 
           ORT_VERSION=1.23.0
