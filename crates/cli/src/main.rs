@@ -897,16 +897,22 @@ fn configure_ort(cli: &Cli) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if cli.auto_ort {
-        if std::env::var_os("ORT_DYLIB_PATH").is_some() {
-            return Ok(());
-        }
-        if let Some(found) = find_ort_dylib()? {
-            info!(path = %found.display(), "using ORT dylib");
-            // SAFETY: called once during startup, before any other threads exist.
-            unsafe { std::env::set_var("ORT_DYLIB_PATH", found) };
-        } else {
-            tracing::warn!("failed to auto-detect libonnxruntime.so");
+    // No explicit path: auto-detect the runtime bundled next to the binary
+    // (or in the local cache) so a bundled asset works with zero flags.
+    // `--auto-ort` widens that scan to the system library directories.
+    if std::env::var_os("ORT_DYLIB_PATH").is_none() {
+        match find_ort_dylib(cli.auto_ort)? {
+            Some(found) => {
+                info!(path = %found.display(), "auto-detected ONNX Runtime");
+                // SAFETY: called once during startup, before any other threads exist.
+                unsafe { std::env::set_var("ORT_DYLIB_PATH", found) };
+            }
+            None if cli.auto_ort => {
+                tracing::warn!("failed to auto-detect the ONNX Runtime library");
+            }
+            None => {
+                debug!("no bundled or cached ONNX Runtime library found; relying on system lookup");
+            }
         }
     }
 
@@ -914,21 +920,69 @@ fn configure_ort(cli: &Cli) -> anyhow::Result<()> {
 }
 
 #[cfg(feature = "semantic")]
-fn find_ort_dylib() -> anyhow::Result<Option<PathBuf>> {
+fn ort_dylib_names() -> &'static [&'static str] {
+    &[
+        "libonnxruntime.so",
+        "libonnxruntime.dylib",
+        "onnxruntime.dll",
+    ]
+}
+
+/// Runtime search roots relative to the executable's directory. Bundled assets
+/// lay out `bin/<exe>`, `runtime/onnxruntime/...`, and `models/...` as siblings,
+/// so the runtime sits next to the exe's parent directory; a flat extraction
+/// has `runtime/` next to the exe itself.
+#[cfg(feature = "semantic")]
+fn bundle_runtime_roots(exe_dir: &std::path::Path) -> Vec<PathBuf> {
     let mut roots = Vec::new();
+    if let Some(bundle_root) = exe_dir.parent() {
+        roots.push(bundle_root.join("runtime"));
+    }
+    roots.push(exe_dir.join("runtime"));
+    roots
+}
+
+/// Model-directory search candidates relative to the executable's directory.
+#[cfg(feature = "semantic")]
+fn bundle_model_dirs(exe_dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(bundle_root) = exe_dir.parent() {
+        dirs.push(bundle_root.join("models").join("bge-small-en-v1.5"));
+        dirs.push(bundle_root.join("model"));
+    }
+    dirs.push(exe_dir.join("models").join("bge-small-en-v1.5"));
+    dirs.push(exe_dir.join("model"));
+    dirs
+}
+
+#[cfg(feature = "semantic")]
+fn find_ort_dylib(include_system_paths: bool) -> anyhow::Result<Option<PathBuf>> {
+    let mut roots = Vec::new();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        roots.extend(bundle_runtime_roots(dir));
+    }
     if let Some(cache_dir) = dirs::cache_dir() {
         roots.push(cache_dir.join("onnxruntime"));
     }
-    roots.push(PathBuf::from("/usr/lib"));
-    roots.push(PathBuf::from("/usr/local/lib"));
+    if include_system_paths {
+        roots.push(PathBuf::from("/usr/lib"));
+        roots.push(PathBuf::from("/usr/local/lib"));
+    }
 
+    let names = ort_dylib_names();
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for root in roots {
         if !root.exists() {
             continue;
         }
         for path in walk_paths(&root)? {
-            if path.file_name().and_then(|s| s.to_str()) == Some("libonnxruntime.so") {
+            let is_ort = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .is_some_and(|n| names.contains(&n));
+            if is_ort {
                 let modified = std::fs::metadata(&path)
                     .and_then(|m| m.modified())
                     .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
@@ -1076,8 +1130,7 @@ fn detect_model_path() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        candidates.push(dir.join("models").join("bge-small-en-v1.5"));
-        candidates.push(dir.join("model"));
+        candidates.extend(bundle_model_dirs(dir));
     }
     if let Some(cache_dir) = dirs::cache_dir() {
         candidates.push(cache_dir.join("remi").join("bge-small-en-v1.5"));
@@ -1100,6 +1153,34 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(feature = "semantic")]
+    #[test]
+    fn bundle_runtime_and_model_roots_cover_both_layouts() {
+        // Bundled layout: bin/remi with runtime/ and models/ as siblings of bin/.
+        let exe_dir = PathBuf::from("/x/bundle/bin");
+        assert_eq!(
+            bundle_runtime_roots(&exe_dir),
+            vec![
+                PathBuf::from("/x/bundle/runtime"),
+                PathBuf::from("/x/bundle/bin/runtime")
+            ]
+        );
+        let dirs = bundle_model_dirs(&exe_dir);
+        assert!(dirs.contains(&PathBuf::from("/x/bundle/models/bge-small-en-v1.5")));
+        assert!(dirs.contains(&PathBuf::from("/x/bundle/model")));
+        assert!(dirs.contains(&PathBuf::from("/x/bundle/bin/models/bge-small-en-v1.5")));
+
+        // Flat layout: exe directly next to runtime/ and models/.
+        let flat = PathBuf::from("/x/flat");
+        assert_eq!(
+            bundle_runtime_roots(&flat),
+            vec![
+                PathBuf::from("/x/runtime"),
+                PathBuf::from("/x/flat/runtime")
+            ]
+        );
+    }
 
     #[test]
     fn sanitize_title_strips_newlines() {
