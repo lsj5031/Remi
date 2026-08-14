@@ -63,6 +63,18 @@ jobs:
             cp dist/bundled/models/bge-small-en-v1.5/onnx/model.onnx dist/bundled/models/bge-small-en-v1.5/model.onnx
           fi
 
+          # snapshot_download pulls every weight format from the HF repo; the
+          # embedder only loads model.onnx + tokenizer.json. Drop the duplicate
+          # weight copies (safetensors, pytorch bin, onnx/ mirror) and keep the
+          # single ONNX model plus the small config/tokenizer files, so the
+          # bundled asset stays ~100 MB instead of ~320 MB.
+          rm -rf dist/bundled/models/bge-small-en-v1.5/onnx
+          find dist/bundled/models/bge-small-en-v1.5 -type f \
+            ! -name 'model.onnx' ! -name 'tokenizer.json' ! -name 'config.json' \
+            ! -name 'special_tokens_map.json' ! -name 'tokenizer_config.json' \
+            ! -name 'vocab.txt' ! -name 'modules.json' \
+            ! -name 'sentence_bert_config.json' ! -name 'config_sentence_transformers.json' \
+            -delete
           rm -rf dist/bundled/models/bge-small-en-v1.5/.cache
           tar -czf remi-linux-x64-bundled.tar.gz -C dist/bundled .
 

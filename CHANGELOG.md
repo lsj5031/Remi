@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-08-14
+
+### Changed
+
+- Bundled Linux release asset pruned to a single ONNX model plus tokenizer/config files: `remi-linux-x64-bundled.tar.gz` drops from ~320 MB to ~85 MB with no functional change (the embedder only loads `model.onnx` and `tokenizer.json`).
+
 ## [0.2.0] - 2026-08-14
 
 ### Added
