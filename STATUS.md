@@ -1,4 +1,4 @@
-# Status: v0.2.0 Released
+# Status: v0.2.2 Released
 
 ## Completed
 - [x] **Phase 0: Repo Bootstrap**: Workspace structure, `Cargo.toml`, `git init`, `.gitignore`.
